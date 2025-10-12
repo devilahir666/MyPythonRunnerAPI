@@ -1,3 +1,22 @@
 fastapi
 uvicorn
 pydantic
+
+# Core Data Science & Math
+requests
+pandas
+numpy
+scipy           # Advanced math and science
+matplotlib      # Plotting and charting (Output will be text-based)
+
+# Web/Scraping & Async
+python-telegram-bot
+beautifulsoup4
+lxml
+selenium        # Web automation (Note: Render's free tier may block headless browsers)
+httpx           # Modern async HTTP requests
+
+# Utilities & Config
+pyyaml
+python-dateutil
+tqdm            # Progress bar for loops (User experience)
