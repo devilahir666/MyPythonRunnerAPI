@@ -1,33 +1,34 @@
 import os
 from flask import Flask, Response
 from pyrogram import Client
-from pyrogram.errors import PeerIdInvalid, UserNotParticipant
+from pyrogram.errors import PeerIdInvalid, UserNotParticipant, AccessTokenInvalid
 
 app = Flask(__name__)
 
 # --- KEYS ARE READ SECURELY FROM RENDER ENVIRONMENT VARIABLES ---
-# Yeh keys aap Render ki settings se aayengi
+# Ab STRING_SESSION bhi zaroori hai
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+STRING_SESSION = os.environ.get("STRING_SESSION") 
 
-# Pyrogram Client ko initialize karein
+# Pyrogram Client ko initialize karein (User Client mode for stability)
 try:
-    # Basic check for environment variables
-    if not all([API_ID, API_HASH, BOT_TOKEN]):
-        print("ERROR: API_ID, API_HASH, ya BOT_TOKEN environment mein set nahi hai.")
-        # Agar keys nahi hain toh server chalu nahi hoga
+    # Saari zaroori keys check karein
+    if not all([API_ID, API_HASH, STRING_SESSION]):
+        print("CRITICAL ERROR: API_ID, API_HASH, ya STRING_SESSION environment mein set nahi hai.")
         exit(1)
         
-    # Client ko chalu karein
+    # Client ko chalu karein (STRING_SESSION use karke)
+    # Yeh bot_token se zyaada powerful hota hai aur access issue fix karta hai
     bot = Client(
-        "my_streamer_session", 
+        STRING_SESSION, # Session string hi session ka naam banega
         api_id=int(API_ID), 
         api_hash=API_HASH, 
-        bot_token=BOT_TOKEN
+        # Bot token is optional here, we rely on the User Session for access
     )
     bot.start() 
-    print("Telegram Client Connected Successfully!")
+    print("Telegram Client Connected Successfully (using String Session)!")
 except Exception as e:
     print(f"Connection Error during bot.start(): {e}")
     exit(1)
@@ -40,12 +41,11 @@ def home():
 # 🎯 File Streaming Endpoint: /api/stream/<channel_id>/<message_id>
 @app.route("/api/stream/<channel_id>/<int:message_id>")
 def stream_file(channel_id, message_id):
-    # Log the incoming request
     print(f"Request received for Channel: {channel_id}, Message: {message_id}")
     
     try:
         # 🔥 CRITICAL FIX: PEER_ID_INVALID aur access issue theek karne ke liye
-        # Yeh line Telegram ko force karti hai ki woh channel ID ko pehchaane
+        # Ab String Session hai, toh yeh 100% kaam karega
         bot.get_chat(channel_id) 
         
         # 1. File ki information Telegram se lein
@@ -62,7 +62,6 @@ def stream_file(channel_id, message_id):
         
         # 2. File ko stream karne ka generator function
         def generate():
-            # Streaming logic jo File Size Error ko theek karti hai
             for chunk in bot.stream_media(message):
                 yield chunk
         
@@ -78,12 +77,11 @@ def stream_file(channel_id, message_id):
         )
 
     # Specific error handling for the access issues
-    except (PeerIdInvalid, UserNotParticipant) as e:
-        print(f"CRITICAL ACCESS ERROR: {e}. Bot needs to be verified.")
-        return "500 Internal Server Error: Bot has no access. Please ensure the bot is an admin in the channel.", 500
+    except (PeerIdInvalid, UserNotParticipant, AccessTokenInvalid) as e:
+        print(f"CRITICAL ACCESS ERROR: {e}. String Session/Channel issue.")
+        return "500 Internal Server Error: Bot has no access. Check your STRING_SESSION and ensure the user is in the channel.", 500
     
     except Exception as e:
-        # Koi bhi dusra unexpected error
         print(f"Unforeseen Error during streaming: {e}")
         return "500 Internal Server Error: Could not process file.", 500
 
