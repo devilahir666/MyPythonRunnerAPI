@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: python-interpreter-api-{{YOUR_NAME}} # Name ko unique rakhein, jaise: python-interpreter-api-bhai
-    env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
-    # Free instance type for initial testing
-    plan: free
-    region: oregon # Aap koi bhi region chun sakte hain (jaise singapoore)
