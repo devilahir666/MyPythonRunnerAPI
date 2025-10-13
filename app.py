@@ -17,17 +17,16 @@ try:
         print("CRITICAL ERROR: API_ID, API_HASH, STRING_SESSION, ya BOT_TOKEN missing hain.")
         exit(1)
         
-    # 🔥 FIX: is_bot=True argument hata diya
+    # Final Client Initialization: BOT_TOKEN ko session_name mein aur STRING_SESSION se login
     bot = Client(
-        BOT_TOKEN.split(":")[0], 
-        session_string=STRING_SESSION, 
+        BOT_TOKEN.split(":")[0], # Session file ka chota naam
+        session_string=STRING_SESSION, # String Session se login (Access ke liye)
         api_id=int(API_ID), 
         api_hash=API_HASH, 
         bot_token=BOT_TOKEN
-        # is_bot=True ab nahi hai
     )
     bot.start() 
-    print("Telegram Client Connected Successfully (Final Attempt)!")
+    print("Telegram Client Connected Successfully!")
 except Exception as e:
     print(f"Connection Error during bot.start(): {e}")
     exit(1)
@@ -46,19 +45,27 @@ def stream_file(channel_id, message_id):
         # CRITICAL FIX: get_chat se access confirm karenge
         bot.get_chat(channel_id) 
         
+        # 1. Message ko lein
         message = bot.get_messages(channel_id, message_id)
         
-        if not message.media or not message.document:
-            return "404 Not Found: File not attached to this message.", 404
+        # 2. 🔥 FILE DETAILS NIKALNE KA NAYA TARIKA (Forwarded files ke liye)
+        if message.video:
+            file_info = message.video
+        elif message.document:
+            file_info = message.document
+        else:
+            return "404 Not Found: Message mein video ya document nahi mila. File ko check karein.", 404
 
-        file_name = message.document.file_name
-        file_size = message.document.file_size
-        mime_type = message.document.mime_type
+        file_name = file_info.file_name
+        file_size = file_info.file_size
+        mime_type = file_info.mime_type
         
+        # 3. File ko stream karne ka generator function
         def generate():
             for chunk in bot.stream_media(message):
                 yield chunk
         
+        # 4. HTTP Response set karein
         return Response(
             generate(),
             mimetype=mime_type or 'application/octet-stream', 
@@ -77,4 +84,8 @@ def stream_file(channel_id, message_id):
     except Exception as e:
         print(f"Unforeseen Error during streaming: {e}")
         return "500 Internal Server Error: Could not process file.", 500
-        
+
+# Yeh function Gunicorn run karega
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
+    
