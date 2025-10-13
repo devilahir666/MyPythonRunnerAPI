@@ -9,26 +9,27 @@ app = Flask(__name__)
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 STRING_SESSION = os.environ.get("STRING_SESSION") 
+BOT_TOKEN = os.environ.get("BOT_TOKEN") # <--- Bot Token ko dobara padha
 
-# Pyrogram Client ko initialize karein
+# Pyrogram Client ko initialize karein (STRING_SESSION aur BOT_TOKEN dono use karke)
 try:
-    if not all([API_ID, API_HASH, STRING_SESSION]):
-        print("CRITICAL ERROR: API_ID, API_HASH, ya STRING_SESSION environment mein set nahi hai.")
+    if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN]): # <--- Ab saari keys check honge
+        print("CRITICAL ERROR: API_ID, API_HASH, STRING_SESSION, ya BOT_TOKEN missing hain.")
         exit(1)
         
-    # 🔥 FIXED CODE: Ab session ka naam chota rakhenge ('stream_session')
-    # aur STRING_SESSION ko 'session_string' argument se pass karenge.
+    # 🔥 FINAL FIX: Session ke saath BOT_TOKEN bhi initialize kiya jaayega
+    # Session name wahi rakhenge, lekin bot_token bhi pass karenge
     bot = Client(
-        "stream_session", # <--- Session file ka chota aur fixed naam
-        session_string=STRING_SESSION, # <--- Asli data yahan se jaayega
+        "stream_session",
+        session_string=STRING_SESSION, 
         api_id=int(API_ID), 
         api_hash=API_HASH, 
+        bot_token=BOT_TOKEN # <--- Yahi woh missing piece tha
     )
     bot.start() 
-    print("Telegram Client Connected Successfully (using String Session)!")
+    print("Telegram Client Connected Successfully (using String Session and Bot Token)!")
 except Exception as e:
     print(f"Connection Error during bot.start(): {e}")
-    # Error aane par server ko band kar denge
     exit(1)
 
 # Simple home route
@@ -71,7 +72,7 @@ def stream_file(channel_id, message_id):
     # Specific error handling for the access issues
     except (PeerIdInvalid, UserNotParticipant, AccessTokenInvalid) as e:
         print(f"CRITICAL ACCESS ERROR: {e}. Session failed.")
-        return "500 Internal Server Error: Session failed. Check STRING_SESSION and ensure the user is in the channel.", 500
+        return "500 Internal Server Error: Session failed. Check STRING_SESSION/Bot Access.", 500
     
     except Exception as e:
         print(f"Unforeseen Error during streaming: {e}")
