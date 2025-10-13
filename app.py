@@ -42,14 +42,15 @@ def stream_file_by_id(file_id):
     print(f"Request received for File ID: {file_id}")
     
     try:
-        # 1. File Object ko seedhe FILE_ID se lein (Ismein file_name aur size mil jaayega)
+        # 1. File Object ko seedhe FILE_ID se lein
         file_object = bot.get_file(file_id) 
 
+        # 🔥 FIX: file_object se details nikalna (Yeh hi woh galti thi jo file_name error de rahi thi)
         file_name = file_object.file_name if file_object.file_name else "file.bin"
         file_size = file_object.file_size
         mime_type = file_object.mime_type if file_object.mime_type else 'application/octet-stream'
         
-        # 2. File object ko stream karein
+        # 2. File object ko stream karne ka generator function
         def generate():
             # bot.stream_media File object ya File ID string dono le sakta hai
             for chunk in bot.stream_media(file_object):
