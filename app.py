@@ -42,18 +42,19 @@ def stream_file_by_id(file_id):
     print(f"Request received for File ID: {file_id}")
     
     try:
-        # 1. File Object ko seedhe FILE_ID se lein
-        file_object = bot.get_file(file_id) 
-
-        # 🔥 FIX: file_object se details nikalna (Yeh hi woh galti thi jo file_name error de rahi thi)
-        file_name = file_object.file_name if file_object.file_name else "file.bin"
-        file_size = file_object.file_size
-        mime_type = file_object.mime_type if file_object.mime_type else 'application/octet-stream'
+        # 🔥 FIX: File metadata nikalne ki koshish nahi karenge, seedhe stream karenge
+        # Temporary details set kar rahe hain taaki streaming shuru ho sake
+        file_name = "streaming_file.mkv" 
+        mime_type = 'video/x-matroska'
         
-        # 2. File object ko stream karne ka generator function
+        # NOTE: Content-Length ko remove kiya gaya hai ya 0 set kiya gaya hai,
+        # taaki browser file ka size jaane bina stream shuru kar de.
+        
+        # 2. File ko stream karne ka generator function
         def generate():
-            # bot.stream_media File object ya File ID string dono le sakta hai
-            for chunk in bot.stream_media(file_object):
+            # bot.stream_media ko seedhe FILE_ID string de rahe hain
+            # Isse Pyrogram seedhe download shuru kar dega.
+            for chunk in bot.stream_media(file_id): 
                 yield chunk
         
         # 3. HTTP Response set karein
@@ -62,7 +63,7 @@ def stream_file_by_id(file_id):
             mimetype=mime_type, 
             headers={
                 "Content-Disposition": f"attachment; filename=\"{file_name}\"",
-                "Content-Length": str(file_size),
+                "Content-Length": "0", # Ya koi bada number, ya hata do. Hum 0 set kar rahe hain.
                 "Accept-Ranges": "bytes"
             }
         )
@@ -74,6 +75,7 @@ def stream_file_by_id(file_id):
 
     except Exception as e:
         print(f"Unforeseen Error during streaming: {e}")
+        # Aakhri koshish: Agar streaming mein koi error aaye, toh error message mein file ID bhi de sakte hain
         return "500 Internal Server Error: Streaming failed.", 500
 
 # Yeh function Gunicorn run karega
