@@ -11,24 +11,23 @@ API_HASH = os.environ.get("API_HASH")
 STRING_SESSION = os.environ.get("STRING_SESSION") 
 BOT_TOKEN = os.environ.get("BOT_TOKEN") 
 
-# Pyrogram Client ko initialize karein (STRING_SESSION aur BOT_TOKEN dono use karke)
+# Pyrogram Client ko initialize karein
 try:
     if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN]):
         print("CRITICAL ERROR: API_ID, API_HASH, STRING_SESSION, ya BOT_TOKEN missing hain.")
         exit(1)
         
-    # 🔥 FINAL FIX: Bot mode ko ON karna aur BOT_TOKEN ko session_name mein use karna
-    # BOT_TOKEN.split(":")[0] se hum Bot ID lete hain, jisse session file ka naam chota rahe.
+    # 🔥 FIX: is_bot=True argument hata diya
     bot = Client(
-        BOT_TOKEN.split(":")[0], # <--- Session file ka chota aur fixed naam (Bot ID)
-        session_string=STRING_SESSION, # <--- String Session se login (Access ke liye)
+        BOT_TOKEN.split(":")[0], 
+        session_string=STRING_SESSION, 
         api_id=int(API_ID), 
         api_hash=API_HASH, 
-        bot_token=BOT_TOKEN, 
-        is_bot=True # <--- Yahi woh aakhri setting hai jo access confusion ko theek karti hai
+        bot_token=BOT_TOKEN
+        # is_bot=True ab nahi hai
     )
     bot.start() 
-    print("Telegram Client Connected Successfully (Forced Bot Mode)!")
+    print("Telegram Client Connected Successfully (Final Attempt)!")
 except Exception as e:
     print(f"Connection Error during bot.start(): {e}")
     exit(1)
@@ -78,8 +77,4 @@ def stream_file(channel_id, message_id):
     except Exception as e:
         print(f"Unforeseen Error during streaming: {e}")
         return "500 Internal Server Error: Could not process file.", 500
-
-# Yeh function Gunicorn run karega
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
-    
+        
