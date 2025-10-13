@@ -1,7 +1,7 @@
 import os
 from flask import Flask, Response
 from pyrogram import Client
-from pyrogram.errors import PeerIdInvalid, UserNotParticipant, AccessTokenInvalid
+from pyrogram.errors import PeerIdInvalid, UserNotParticipant, AccessTokenInvalid, FileIdInvalid
 
 app = Flask(__name__)
 
@@ -17,10 +17,10 @@ try:
         print("CRITICAL ERROR: API_ID, API_HASH, STRING_SESSION, ya BOT_TOKEN missing hain.")
         exit(1)
         
-    # Final Client Initialization: BOT_TOKEN ko session_name mein aur STRING_SESSION se login
+    # Final Client Initialization: STRING_SESSION aur BOT_TOKEN dono ka use
     bot = Client(
-        BOT_TOKEN.split(":")[0], # Session file ka chota naam
-        session_string=STRING_SESSION, # String Session se login (Access ke liye)
+        BOT_TOKEN.split(":")[0],
+        session_string=STRING_SESSION, 
         api_id=int(API_ID), 
         api_hash=API_HASH, 
         bot_token=BOT_TOKEN
@@ -34,41 +34,31 @@ except Exception as e:
 # Simple home route
 @app.route('/')
 def home():
-    return "Telegram Streaming Proxy is Running. Use /api/stream/<channel_id>/<message_id> to stream.", 200
+    return "Telegram Streaming Proxy is Running. Use /api/stream/<file_id> to stream.", 200
 
-# 🎯 File Streaming Endpoint
-@app.route("/api/stream/<channel_id>/<int:message_id>")
-def stream_file(channel_id, message_id):
-    print(f"Request received for Channel: {channel_id}, Message: {message_id}")
+# 🎯 FINAL FILE STREAMING ENDPOINT (Uses FILE_ID directly)
+@app.route("/api/stream/<file_id>")
+def stream_file_by_id(file_id):
+    print(f"Request received for File ID: {file_id}")
     
     try:
-        # CRITICAL FIX: get_chat se access confirm karenge
-        bot.get_chat(channel_id) 
-        
-        # 1. Message ko lein
-        message = bot.get_messages(channel_id, message_id)
-        
-        # 2. 🔥 FILE DETAILS NIKALNE KA NAYA TARIKA (Forwarded files ke liye)
-        if message.video:
-            file_info = message.video
-        elif message.document:
-            file_info = message.document
-        else:
-            return "404 Not Found: Message mein video ya document nahi mila. File ko check karein.", 404
+        # 1. File Object ko seedhe FILE_ID se lein (Ismein file_name aur size mil jaayega)
+        file_object = bot.get_file(file_id) 
 
-        file_name = file_info.file_name
-        file_size = file_info.file_size
-        mime_type = file_info.mime_type
+        file_name = file_object.file_name if file_object.file_name else "file.bin"
+        file_size = file_object.file_size
+        mime_type = file_object.mime_type if file_object.mime_type else 'application/octet-stream'
         
-        # 3. File ko stream karne ka generator function
+        # 2. File object ko stream karein
         def generate():
-            for chunk in bot.stream_media(message):
+            # bot.stream_media File object ya File ID string dono le sakta hai
+            for chunk in bot.stream_media(file_object):
                 yield chunk
         
-        # 4. HTTP Response set karein
+        # 3. HTTP Response set karein
         return Response(
             generate(),
-            mimetype=mime_type or 'application/octet-stream', 
+            mimetype=mime_type, 
             headers={
                 "Content-Disposition": f"attachment; filename=\"{file_name}\"",
                 "Content-Length": str(file_size),
@@ -76,14 +66,14 @@ def stream_file(channel_id, message_id):
             }
         )
 
-    # Specific error handling for the access issues
-    except (PeerIdInvalid, UserNotParticipant, AccessTokenInvalid) as e:
-        print(f"CRITICAL ACCESS ERROR: {e}. Session failed.")
-        return "500 Internal Server Error: Session failed. Check STRING_SESSION/Bot Access.", 500
-    
+    # Specific error handling for the file ID issues
+    except FileIdInvalid as e:
+        print(f"CRITICAL FILE ID ERROR: File ID galat hai ya expired hai. {e}")
+        return "400 Bad Request: File ID galat hai ya expired ho gayi hai.", 400
+
     except Exception as e:
         print(f"Unforeseen Error during streaming: {e}")
-        return "500 Internal Server Error: Could not process file.", 500
+        return "500 Internal Server Error: Streaming failed.", 500
 
 # Yeh function Gunicorn run karega
 if __name__ == "__main__":
