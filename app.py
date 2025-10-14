@@ -1,10 +1,10 @@
 import os
 import re
 import asyncio
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request 
+from starlette.responses import StreamingResponse # <--- Naya Import
 from pyrogram import Client
 from pyrogram.errors import FileReferenceExpired, RPCError
-from starlette.background import BackgroundTask
 from typing import AsyncGenerator
 
 # --- HARDCODED KEYS ---
@@ -26,7 +26,6 @@ async def startup_event():
             print("CRITICAL ERROR: Keys are missing or empty.")
             raise Exception("Missing Environment Variables")
 
-        # Pyrogram Client ko ASYNC mode mein initialize karo
         client = Client(
             name=BOT_TOKEN.split(":")[0],
             session_string=STRING_SESSION,
@@ -39,7 +38,6 @@ async def startup_event():
         print("Telegram Async Client Connected Successfully!")
     except Exception as e:
         print(f"Connection Error during client.start(): {e}")
-        # Agar connection fail ho toh app ko start hone se roko
         raise
 
 @app.on_event("shutdown")
@@ -65,7 +63,6 @@ async def stream_generator(message, offset: int, limit: int) -> AsyncGenerator[b
             yield chunk
     except Exception as e:
         print(f"Stream generation error: {e}")
-        # Agar stream fail ho toh generator ko band kar do
         return
 
 # 🎯 FINAL ASYNC ROUTE
@@ -74,7 +71,6 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
     print(f"Request received for Chat ID: {chat_id}, Message ID: {message_id}")
     
     try:
-        # ASYNC client.get_messages() use ho raha hai
         message = await client.get_messages(
             chat_id=chat_id,
             message_ids=message_id
@@ -115,11 +111,12 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
 
         limit = end_byte - start_byte + 1 if end_byte is not None else file_size - start_byte
 
-        # Final Async Response
-        return Response(
+        # 🔥 FINAL FIX: StreamingResponse use karna
+        return StreamingResponse(
             content=stream_generator(message, start_byte, limit),
             status_code=status_code,
             headers=headers,
+            media_type=mime_type # Media type specify karna zaroori hai
         )
 
     except HTTPException:
