@@ -10,20 +10,21 @@ from typing import AsyncGenerator, Optional
 # db.py se Supabase function import karein
 from db import get_movie_data 
 
-# --- HARDCODED TELEGRAM KEYS ---
+# --- 🔥 FRESH HARDCODED TELEGRAM KEYS 🔥 ---
+# Telethon client ko connect karne ke liye
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57"
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGn7N5F_U87nR9FRwKv98"
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
 SESSION_NAME = "stream_bot_session"
 
-# Pyrogram ke liye bada chunk size (4MB)
+# Streaming ke liye bada chunk size (4MB)
 CHUNK_SIZE_BYTES = 4 * 1024 * 1024 
 
 # FastAPI aur Telethon Client ka setup
 app = FastAPI(title="Stable Telethon Streaming Proxy (Supabase)")
 client: Optional[TelegramClient] = None 
 
-# ✅ FIX: Deployment Stability ke liye, agar client fail ho toh server chalta rahe.
+# ✅ FIX: Deployment Stability. Agar client fail ho toh server chalta rahe.
 @app.on_event("startup")
 async def startup_event():
     global client
@@ -66,16 +67,16 @@ async def stream_generator(file_id: str, file_size: int, offset: int, limit: int
     # Permanent File ID se file object banana
     try:
         # Telethon file_id ko InputDocumentFileLocation mein decode karta hai
-        # get_document se InputDocumentFileLocation object milta hai
         file_location = await client.get_document(file_id)
         
         if not file_location:
             raise ValueError(f"Could not resolve file ID: {file_id}")
             
     except Exception as e:
-        print(f"Error resolving permanent File ID: {e}")
         # Agar yahan error aaya to client ko batao ki file hi nahi mili
-        raise HTTPException(status_code=404, detail=f"File ID Resolution Failed: {file_id}")
+        print(f"Error resolving permanent File ID: {e}")
+        # Telethon file reference ko resolve nahi kar paya.
+        raise HTTPException(status_code=404, detail=f"File ID Resolution Failed or Client Uninitialized.") 
 
     # Streaming start karna
     for attempt in range(max_retries):
@@ -95,6 +96,7 @@ async def stream_generator(file_id: str, file_size: int, offset: int, limit: int
             print(f"FileReferenceExpiredError on attempt {attempt + 1}. Telethon should automatically refresh...")
             await asyncio.sleep(1) 
             if attempt >= max_retries - 1:
+                # Agar saare retries fail ho gaye, toh error raise karo
                 raise
         
         except asyncio.CancelledError:
@@ -111,8 +113,9 @@ async def stream_file_by_db_id(movie_uuid: str, request: Request):
     global client 
     print(f"Request received for Movie UUID: {movie_uuid}")
     
-    # ✅ FIX: Agar client initialize nahi hua toh 503 error do (taaki deployment fail na ho)
+    # ✅ FIX: Agar client initialize nahi hua toh 503 error do 
     if not client:
+        # Yeh error tab aata hai jab startup_event mein connection fail ho
         raise HTTPException(status_code=503, detail="Service Unavailable: Telegram client not connected/initialized.")
 
     # 1. Supabase se Permanent File ID, Title, aur Size fetch karo
@@ -163,4 +166,5 @@ async def stream_file_by_db_id(movie_uuid: str, request: Request):
         )
     except Exception as e:
         print(f"Error setting up StreamingResponse: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error: Final setup failed.")
+        # Agar streaming fail ho to 500 internal server error de
+        raise HTTPException(status_code=500, detail="Internal Server Error: Streaming failed.")
