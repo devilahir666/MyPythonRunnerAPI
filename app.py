@@ -2,7 +2,7 @@ import os
 import re
 import asyncio
 from fastapi import FastAPI, HTTPException, Request 
-from starlette.responses import StreamingResponse # <--- Naya Import
+from starlette.responses import StreamingResponse 
 from pyrogram import Client
 from pyrogram.errors import FileReferenceExpired, RPCError
 from typing import AsyncGenerator
@@ -15,7 +15,7 @@ BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
 
 # FastAPI aur Pyrogram Client ka setup
 app = FastAPI(title="Telegram Async Streamer")
-client = None # Global async client
+client = None 
 
 # Client ko start/stop karne ke liye hooks
 @app.on_event("startup")
@@ -53,17 +53,44 @@ async def home():
 
 # Generator function for streaming
 async def stream_generator(message, offset: int, limit: int) -> AsyncGenerator[bytes, None]:
-    try:
-        # ASYNC client.stream_media() use ho raha hai
-        async for chunk in client.stream_media(
-            message,
-            offset=offset,
-            limit=limit
-        ):
-            yield chunk
-    except Exception as e:
-        print(f"Stream generation error: {e}")
-        return
+    max_retries = 3
+    
+    # Hum stream karne ki koshish karenge aur agar File Reference Expired hua toh retry karenge
+    for attempt in range(max_retries):
+        try:
+            # client.stream_media() mein Pyrogram ka chunk size default 1MB hai
+            async for chunk in client.stream_media(
+                message,
+                offset=offset,
+                limit=limit
+            ):
+                yield chunk
+            # Agar streaming poori ho gayi toh loop se bahar nikal jao
+            return
+        
+        except FileReferenceExpired:
+            print(f"FileReferenceExpired on attempt {attempt + 1}. Retrying...")
+            # File Reference Expired hone par Pyrogram file ko dobara fetch karne ki koshish karta hai
+            # Lekin hum message ko dobara fetch kar lenge taaki naya reference mil jaaye
+            try:
+                # Naya message object fetch karne se naya file reference milta hai
+                message = await client.get_messages(
+                    chat_id=message.chat.id,
+                    message_ids=message.id
+                )
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1) # Thoda wait, phir retry
+                    continue
+                else:
+                    # Akhri attempt fail
+                    raise
+            except Exception as e:
+                print(f"Error refreshing message reference: {e}")
+                raise # Agar refresh fail ho toh asli error fenk do
+        
+        except Exception as e:
+            print(f"Stream generation error: {e}")
+            raise # Dusre errors ko seedha fenk do
 
 # 🎯 FINAL ASYNC ROUTE
 @app.get("/api/stream/{chat_id}/{message_id}")
@@ -71,6 +98,7 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
     print(f"Request received for Chat ID: {chat_id}, Message ID: {message_id}")
     
     try:
+        # Message details fetch karo
         message = await client.get_messages(
             chat_id=chat_id,
             message_ids=message_id
@@ -111,16 +139,17 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
 
         limit = end_byte - start_byte + 1 if end_byte is not None else file_size - start_byte
 
-        # 🔥 FINAL FIX: StreamingResponse use karna
+        # StreamingResponse use karna
         return StreamingResponse(
             content=stream_generator(message, start_byte, limit),
             status_code=status_code,
             headers=headers,
-            media_type=mime_type # Media type specify karna zaroori hai
+            media_type=mime_type
         )
 
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error in stream_file_by_id: {e}")
+        # Agar koi aur error aaye toh 500 return karo
         raise HTTPException(status_code=500, detail="Internal Server Error: Streaming failed.")
