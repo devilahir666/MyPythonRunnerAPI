@@ -10,32 +10,34 @@ from typing import AsyncGenerator
 # --- HARDCODED KEYS ---
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57"
-STRING_SESSION = "BQFphUUAHgXd4GHGzpOXFKX1kJ-ScusfrHGvhk_cbLGN5DDa9-IMe08WtUU1pzFuz1DGy9jnwMMsJo2FnUZSQHtXNsaBm-UFA22ZqN4htnHk4-qdkACNpeTXayIcvETMsH97WLERuVr9t9NJTMpVkg4zD57b4CkmLljxqwt81_WQS99wTKzW7uDj412nIFudlHddsqDyiw2aXKM8Ar1yPKXUkpf_xTfrzUEKkrVppdTRdattUqahoq0zrlAUYxUCB-iTipGWJDeDrszD_QsOQs9p2F9WwYP44s6Zx9nznRXcv0EmO0MHjH-Zmew6yHcBAcu_r0-b7wShXytzzJ9EySBRul_2KwAAAAHq-0sgAA"
+# STRING_SESSION ko hata diya gaya hai! Ab Bot client use hoga.
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
+
+# Pyrogram ke liye bada chunk size (4MB)
+CHUNK_SIZE_BYTES = 4 * 1024 * 1024 
 
 # FastAPI aur Pyrogram Client ka setup
 app = FastAPI(title="Telegram Async Streamer")
 client = None 
 
-# Client ko start/stop karne ke liye hooks
 @app.on_event("startup")
 async def startup_event():
     global client
     try:
-        if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN]):
-            print("CRITICAL ERROR: Keys are missing or empty.")
+        if not all([API_ID, API_HASH, BOT_TOKEN]):
+            print("CRITICAL ERROR: API keys or BOT_TOKEN are missing.")
             raise Exception("Missing Environment Variables")
 
+        # 🔥 CHANGES: Ab hum sirf bot_token use kar rahe hain
         client = Client(
             name=BOT_TOKEN.split(":")[0],
-            session_string=STRING_SESSION,
             api_id=int(API_ID),
             api_hash=API_HASH,
-            bot_token=BOT_TOKEN,
+            bot_token=BOT_TOKEN, # Only Bot Token is used
             no_updates=True
         )
         await client.start()
-        print("Telegram Async Client Connected Successfully!")
+        print("Telegram Bot Client Connected Successfully!")
     except Exception as e:
         print(f"Connection Error during client.start(): {e}")
         raise
@@ -45,7 +47,7 @@ async def shutdown_event():
     global client
     if client:
         await client.stop()
-        print("Telegram Async Client Stopped.")
+        print("Telegram Bot Client Stopped.")
 
 @app.get("/")
 async def home():
@@ -54,43 +56,38 @@ async def home():
 # Generator function for streaming
 async def stream_generator(message, offset: int, limit: int) -> AsyncGenerator[bytes, None]:
     max_retries = 3
-    
-    # Hum stream karne ki koshish karenge aur agar File Reference Expired hua toh retry karenge
-    for attempt in range(max_retries):
-        try:
-            # client.stream_media() mein Pyrogram ka chunk size default 1MB hai
-            async for chunk in client.stream_media(
-                message,
-                offset=offset,
-                limit=limit
-            ):
-                yield chunk
-            # Agar streaming poori ho gayi toh loop se bahar nikal jao
-            return
-        
-        except FileReferenceExpired:
-            print(f"FileReferenceExpired on attempt {attempt + 1}. Retrying...")
-            # File Reference Expired hone par Pyrogram file ko dobara fetch karne ki koshish karta hai
-            # Lekin hum message ko dobara fetch kar lenge taaki naya reference mil jaaye
+    async with client: 
+        for attempt in range(max_retries):
             try:
-                # Naya message object fetch karne se naya file reference milta hai
-                message = await client.get_messages(
-                    chat_id=message.chat.id,
-                    message_ids=message.id
-                )
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1) # Thoda wait, phir retry
-                    continue
-                else:
-                    # Akhri attempt fail
+                # client.stream_media() mein humne bada chunk size set kiya hai
+                async for chunk in client.stream_media(
+                    message,
+                    offset=offset,
+                    limit=limit,
+                    chunk_size=CHUNK_SIZE_BYTES 
+                ):
+                    yield chunk
+                return
+            
+            except FileReferenceExpired:
+                print(f"FileReferenceExpired on attempt {attempt + 1}. Retrying...")
+                try:
+                    message = await client.get_messages(
+                        chat_id=message.chat.id,
+                        message_ids=message.id
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1) 
+                        continue
+                    else:
+                        raise
+                except Exception as e:
+                    print(f"Error refreshing message reference: {e}")
                     raise
+            
             except Exception as e:
-                print(f"Error refreshing message reference: {e}")
-                raise # Agar refresh fail ho toh asli error fenk do
-        
-        except Exception as e:
-            print(f"Stream generation error: {e}")
-            raise # Dusre errors ko seedha fenk do
+                print(f"Stream generation error: {e}")
+                raise
 
 # 🎯 FINAL ASYNC ROUTE
 @app.get("/api/stream/{chat_id}/{message_id}")
@@ -112,17 +109,19 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
         file_size = file_info.file_size
         mime_type = file_info.mime_type or 'video/x-matroska'
 
-        # Range Handling
+        # Range Handling (unchanged)
         range_header = request.headers.get('Range')
         start_byte, end_byte = 0, file_size - 1
         status_code = 200
-        
+        # ... (headers preparation logic)
+
         headers = {
             "Content-Type": mime_type,
             "Content-Disposition": f"inline; filename=\"{file_name}\"",
             "Accept-Ranges": "bytes",
         }
-
+        # Simplified Range/Content-Length Calculation
+        content_length = file_size
         if range_header:
             range_match = re.search(r'bytes=(\d+)-(\d*)', range_header)
             if range_match:
@@ -132,14 +131,13 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
                 
                 status_code = 206
                 content_length = end_byte - start_byte + 1
-                headers['Content-Length'] = str(content_length)
                 headers['Content-Range'] = f'bytes {start_byte}-{end_byte}/{file_size}'
-        else:
-             headers['Content-Length'] = str(file_size)
+        
+        headers['Content-Length'] = str(content_length)
 
         limit = end_byte - start_byte + 1 if end_byte is not None else file_size - start_byte
 
-        # StreamingResponse use karna
+        # StreamingResponse
         return StreamingResponse(
             content=stream_generator(message, start_byte, limit),
             status_code=status_code,
@@ -151,5 +149,4 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
         raise
     except Exception as e:
         print(f"Error in stream_file_by_id: {e}")
-        # Agar koi aur error aaye toh 500 return karo
         raise HTTPException(status_code=500, detail="Internal Server Error: Streaming failed.")
