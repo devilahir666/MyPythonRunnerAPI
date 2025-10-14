@@ -5,14 +5,12 @@ from starlette.responses import StreamingResponse
 from telethon import TelegramClient
 from telethon.tl.types import InputDocumentFileLocation
 from telethon.errors.rpcerrorlist import FileReferenceExpiredError
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 # db.py se Supabase function import karein
 from db import get_movie_data 
 
 # --- HARDCODED TELEGRAM KEYS ---
-# NOTE: Telethon ko Bot Token se connect karne ke liye BOT_TOKEN hi kafi hai, 
-# lekin API_ID aur API_HASH bhi dalna zaroori hai.
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57"
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGn7N5F_U87nR9FRwKv98"
@@ -25,28 +23,29 @@ CHUNK_SIZE_BYTES = 4 * 1024 * 1024
 app = FastAPI(title="Stable Telethon Streaming Proxy (Supabase)")
 client: Optional[TelegramClient] = None 
 
-# Client ko startup par sirf ek baar start karna
+# ✅ FIX: Deployment Stability ke liye, agar client fail ho toh server chalta rahe.
 @app.on_event("startup")
 async def startup_event():
     global client
     try:
         if not all([API_ID, API_HASH, BOT_TOKEN]):
             print("CRITICAL ERROR: API keys or BOT_TOKEN are missing.")
-            raise Exception("Missing Credentials")
+            return # Credentials missing, client will remain None
 
         # Bot Client se connect kar rahe hain
-        client = TelegramClient(
+        telethon_client = TelegramClient(
             SESSION_NAME, 
             API_ID, 
             API_HASH
         ).start(bot_token=BOT_TOKEN)
         
         # client object ko await karna zaroori hai
-        client = await client
+        client = await telethon_client
         print("Telegram Bot Client (Telethon) Connected Successfully!")
     except Exception as e:
-        print(f"Connection Error during client.start(): {e}")
-        raise
+        # Agar Telegram connect nahi ho paata, toh client ko None rakho aur server ko chalne do.
+        print(f"CRITICAL: Connection Error during client.start(). Client will be UNAVAILABLE: {e}")
+        client = None
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -66,24 +65,21 @@ async def stream_generator(file_id: str, file_size: int, offset: int, limit: int
 
     # Permanent File ID se file object banana
     try:
-        # File ID ko InputDocumentFileLocation mein convert karein
         # Telethon file_id ko InputDocumentFileLocation mein decode karta hai
+        # get_document se InputDocumentFileLocation object milta hai
         file_location = await client.get_document(file_id)
         
-        # Agar get_document fail ho jaye to error aega
         if not file_location:
             raise ValueError(f"Could not resolve file ID: {file_id}")
             
     except Exception as e:
         print(f"Error resolving permanent File ID: {e}")
-        raise HTTPException(status_code=500, detail="File ID Resolution Failed.")
+        # Agar yahan error aaya to client ko batao ki file hi nahi mili
+        raise HTTPException(status_code=404, detail=f"File ID Resolution Failed: {file_id}")
 
     # Streaming start karna
     for attempt in range(max_retries):
         try:
-            
-            # Telethon mein iter_content() streaming ke liye use hota hai aur ye stable hai.
-            # limit ko chunk_size se replace kar rahe hain
             chunk_generator = client.iter_content(
                 file_location,
                 offset=offset,
@@ -96,14 +92,12 @@ async def stream_generator(file_id: str, file_size: int, offset: int, limit: int
             return
         
         except FileReferenceExpiredError:
-            # Telethon mein ye error khud hi handle ho jaana chahiye, par just in case.
-            print(f"FileReferenceExpiredError on attempt {attempt + 1}. Telethon should refresh...")
+            print(f"FileReferenceExpiredError on attempt {attempt + 1}. Telethon should automatically refresh...")
             await asyncio.sleep(1) 
             if attempt >= max_retries - 1:
                 raise
         
         except asyncio.CancelledError:
-            # Render ya browser ne connection kaata, gracefully exit karna.
             print("Stream cancelled by client (CancelledError).")
             return
             
@@ -117,8 +111,9 @@ async def stream_file_by_db_id(movie_uuid: str, request: Request):
     global client 
     print(f"Request received for Movie UUID: {movie_uuid}")
     
+    # ✅ FIX: Agar client initialize nahi hua toh 503 error do (taaki deployment fail na ho)
     if not client:
-        raise HTTPException(status_code=503, detail="Service Unavailable: Telegram client not initialized.")
+        raise HTTPException(status_code=503, detail="Service Unavailable: Telegram client not connected/initialized.")
 
     # 1. Supabase se Permanent File ID, Title, aur Size fetch karo
     movie_data = get_movie_data(movie_uuid)
@@ -127,11 +122,11 @@ async def stream_file_by_db_id(movie_uuid: str, request: Request):
         raise HTTPException(status_code=404, detail=f"Movie data not found for UUID: {movie_uuid} in Supabase.")
         
     encoded_file_id = movie_data['file_id']
-    file_name = movie_data['title'] + ".mkv" # .mkv extension joda gaya
+    file_name = movie_data['title'] + ".mkv" 
     file_size = movie_data['file_size']
-    mime_type = 'video/x-matroska' # Streaming ke liye common MIME type
+    mime_type = 'video/x-matroska' 
 
-    # 2. Range Handling Logic (same as before)
+    # 2. Range Handling Logic
     range_header = request.headers.get('Range')
     start_byte, end_byte = 0, file_size - 1
     status_code = 200
@@ -156,7 +151,7 @@ async def stream_file_by_db_id(movie_uuid: str, request: Request):
     
     headers['Content-Length'] = str(content_length)
 
-    limit = content_length # jitna range mein data chahiye
+    limit = content_length 
 
     # 3. StreamingResponse
     try:
