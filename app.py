@@ -3,135 +3,122 @@ import re
 import asyncio
 from fastapi import FastAPI, HTTPException, Request 
 from starlette.responses import StreamingResponse 
-# 🔥 Pyrogram ki jagah Telethon aur iske tools import kar rahe hain
 from telethon import TelegramClient
-from telethon.tl.types import InputMessagesFilterDocument
-from telethon.errors import RPCError
+from telethon.tl.types import InputDocumentFileLocation
 from typing import AsyncGenerator
+# 🔥 Humari custom db file import karte hain
+from db import get_movie_data 
 
-# --- MANDATORY TELETHON KEYS (Keys are hardcoded as requested) ---
-# आपके पुराने API ID और HASH
+# --- MANDATORY TELETHON KEYS (Hardcoded) ---
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57"
-# आपका Bot Token
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
 SESSION_NAME = "stream_bot_session" 
 
-# Telethon ke liye bada chunk size (4MB)
 CHUNK_SIZE_BYTES = 4 * 1024 * 1024 
 
-# FastAPI aur Telethon Client ka setup
-app = FastAPI(title="Telegram Telethon Stable Streamer")
+app = FastAPI(title="Telegram Telethon Supabase Streamer")
 client = None 
 
+# Startup aur Shutdown Events (Jismein client initialize hota hai)
 @app.on_event("startup")
 async def startup_event():
     global client
     try:
-        # Telethon Client initialization
-        # 'bot_token' parameter se Bot Token login hota hai
         client = TelegramClient(
             session=SESSION_NAME, 
             api_id=int(API_ID), 
             api_hash=API_HASH
         )
-        
-        # client.start() mein bot token dete hain
         await client.start(bot_token=BOT_TOKEN) 
-        
         print("Telegram Telethon Bot Client Connected Successfully!")
     except Exception as e:
         print(f"Connection Error during client.start(): {e}")
         client = None
-        # Agar client start na ho, toh exception raise karo
         raise
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global client
     if client:
-        # client ko gracefully disconnect karo
         await client.disconnect()
         print("Telegram Telethon Bot Client Disconnected.")
 
 @app.get("/")
 async def home():
-    return {"message": "Telethon Stable Streaming Proxy is Running. Use /api/stream/{chat_id}/{message_id} to stream."}
+    # Ab home page par Supabase ID (UUID) se streaming ka example denge
+    example_uuid = "a03d685b-fe9a-4dda-a65f-bd20a1bf191b" # Example UUID
+    return {"message": "Telethon Supabase Streaming Proxy is Running.", 
+            "usage": f"Use /api/stream/movie/{{movie_uuid}} to stream using Supabase UUID (e.g., /api/stream/movie/{example_uuid})."}
 
-# Generator function for streaming
-async def stream_generator(file_info, offset: int, limit: int) -> AsyncGenerator[bytes, None]:
+
+# Generator function (Same stable logic)
+async def stream_generator(file_id_info, size: int, offset: int, limit: int) -> AsyncGenerator[bytes, None]:
     global client 
-    
     bytes_to_read = limit
     
     try:
-        # 🔥 Telethon ka iter_content() file reference expire hone par auto-refresh karta hai
+        # Telethon's iter_content is the key to stability (it handles file reference refresh)
         async for chunk in client.iter_content(
-            file_info, # Message object ya media object
+            file_id_info, 
             chunk_size=CHUNK_SIZE_BYTES,
             offset=offset
         ):
-            # Limit check (agar range set ho toh)
             if bytes_to_read <= 0:
                 break
-                
             chunk_len = len(chunk)
             if chunk_len > bytes_to_read:
                 yield chunk[:bytes_to_read]
                 break
-            
             yield chunk
             bytes_to_read -= chunk_len
-
         return
-            
     except asyncio.CancelledError:
-        # Browser ya server cancellation ko gracefully handle karo
         print("Stream cancelled by client/server. Exiting generator.")
         return 
-        
     except Exception as e:
         print(f"Telethon Stream generation failed with unhandled error: {e}")
-        # Agar koi aur critical error aaye toh exception throw karo
         raise 
 
-# 🎯 FINAL ASYNC ROUTE
-@app.get("/api/stream/{chat_id}/{message_id}")
-async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
+# 🔥 FINAL ROUTE: Supabase Movie UUID se streaming
+@app.get("/api/stream/movie/{movie_uuid}")
+async def stream_file_by_db_id(movie_uuid: str, request: Request):
     global client 
-    print(f"Request received for Chat ID: {chat_id}, Message ID: {message_id}")
+    print(f"Request received for Movie UUID: {movie_uuid}")
     
     if not client:
         raise HTTPException(status_code=503, detail="Service Unavailable: Telegram client not initialized.")
+    
+    # 🔥 STEP 1: Supabase se permanent file ID, size aur title nikalo
+    movie_data = get_movie_data(movie_uuid)
+    
+    if not movie_data:
+        # Check if the UUID is invalid or data is missing
+        raise HTTPException(status_code=404, detail=f"Movie ID {movie_uuid} not found in Supabase or DB error.")
+    
+    encoded_file_id = movie_data['file_id']
+    file_size = movie_data['file_size']
+    file_name = movie_data['title']
 
     try:
-        # Message details fetch karo (Telethon mein get_messages)
-        message = await client.get_messages(
-            entity=chat_id,
-            ids=message_id
-        )
+        # 🔥 STEP 2: Permanent file ID ko Telethon ke object mein badlo
+        # Telethon yeh object use karke direct permanent file se download karega
+        file_info = client.get_input_media(encoded_file_id)
 
-        if not message or not message.media:
-            raise HTTPException(status_code=404, detail="File not found or message does not contain media.")
-        
-        # File info nikalna
-        file_info = message.media.document or message.media.video
-        if not file_info:
-             raise HTTPException(status_code=404, detail="File not found or message does not contain a file.")
+        # File type check
+        if not hasattr(file_info, 'document'):
+            raise HTTPException(status_code=400, detail="Invalid Telegram File ID stored in DB.")
 
-        # File attributes se name, size, mime type nikalna
-        file_name = getattr(file_info.attributes[0], 'file_name', None) or "streaming_file.mkv"
-        file_size = file_info.size
-        mime_type = file_info.mime_type or 'video/x-matroska'
+        mime_type = 'video/x-matroska' 
 
-        # Range Handling (HTTP standard ke liye)
+        # Range Handling (HTTP standard ke liye) - Wahi robust logic
         range_header = request.headers.get('Range')
         start_byte, end_byte = 0, file_size - 1
         status_code = 200
         
         headers = {
             "Content-Type": mime_type,
-            "Content-Disposition": f"inline; filename=\"{file_name}\"",
+            "Content-Disposition": f"inline; filename=\"{file_name}.mkv\"",
             "Accept-Ranges": "bytes",
         }
 
@@ -145,16 +132,14 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
                 
                 status_code = 206
                 content_length = end_byte - start_byte + 1
-                headers['Content-Length'] = str(content_length)
                 headers['Content-Range'] = f'bytes {start_byte}-{end_byte}/{file_size}'
         
         headers['Content-Length'] = str(content_length)
-
-        limit = end_byte - start_byte + 1 if end_byte is not None else file_size - start_byte
+        limit = end_byte - start_byte + 1 
 
         # StreamingResponse
         return StreamingResponse(
-            content=stream_generator(message, start_byte, limit),
+            content=stream_generator(file_info, file_size, start_byte, limit),
             status_code=status_code,
             headers=headers,
             media_type=mime_type
@@ -163,6 +148,5 @@ async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error in stream_file_by_id: {e}")
-        # Agar koi aur error aaye toh 500 Internal Server Error return karo
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: Telethon Streaming Failed. {str(e)}")
+        print(f"Error in stream_file_by_db_id: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: Streaming Failed. {str(e)}")
