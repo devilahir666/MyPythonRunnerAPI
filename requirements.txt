@@ -1,4 +1,4 @@
 fastapi
 uvicorn
-pyrogram
-cryptg
+python-multipart
+telethon
