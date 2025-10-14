@@ -1,24 +1,26 @@
 import os
-from flask import Flask, Response
-from pyrogram import Client
-from pyrogram.errors import PeerIdInvalid, UserNotParticipant, AccessTokenInvalid, FileIdInvalid
+import re
+from flask import Flask, Response, request
+from pyrogram import Client as SyncClient 
+from pyrogram.errors import FileReferenceExpired, RPCError
 
 app = Flask(__name__)
 
-# --- KEYS ARE READ SECURELY FROM RENDER ENVIRONMENT VARIABLES ---
-API_ID = os.environ.get("API_ID")
-API_HASH = os.environ.get("API_HASH")
-STRING_SESSION = os.environ.get("STRING_SESSION") 
-BOT_TOKEN = os.environ.get("BOT_TOKEN") 
+# --- HARDCODED KEYS (GitHub par mat daalna! Secrets use honge) ---
+# NOTE: Render par deploy karte waqt, yeh values Render Secrets mein daalni hain, 
+# code mein nahi. Lekin abhi testing ke liye rakh rahe hain.
+API_ID = 23692613
+API_HASH = "8bb69956d38a8226433186a199695f57"
+STRING_SESSION = "BQFphUUAHgXd4GHGzpOXFKX1kJ-ScusfrHGvhk_cbLGN5DDa9-IMe08WtUU1pzFuz1DGy9jnwMMsJo2FnUZSQHtXNsaBm-UFA22ZqN4htnHk4-qdkACNpeTXayIcvETMsH97WLERuVr9t9NJTMpVkg4zD57b4CkmLljxqwt81_WQS99wTKzW7uDj412nIFudlHddsqDyiw2aXKM8Ar1yPKXUkpf_xTfrzUEKkrVppdTRdattUqahoq0zrlAUYxUCB-iTipGWJDeDrszD_QsOQs9p2F9wYP44s6Zx9nznRXcv0EmO0MHjH-Zmew6yHcBAcu_r0-b7wShXytzzJ9EySBRul_2KwAAAAHq-0sgAA"
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
 
-# Pyrogram Client ko initialize karein
+# Pyrogram Sync Client
 try:
     if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN]):
-        print("CRITICAL ERROR: API_ID, API_HASH, STRING_SESSION, ya BOT_TOKEN missing hain.")
+        print("CRITICAL ERROR: Keys are missing or empty.")
         exit(1)
         
-    # Final Client Initialization: STRING_SESSION aur BOT_TOKEN dono ka use
-    bot = Client(
+    bot = SyncClient(
         BOT_TOKEN.split(":")[0],
         session_string=STRING_SESSION, 
         api_id=int(API_ID), 
@@ -31,54 +33,82 @@ except Exception as e:
     print(f"Connection Error during bot.start(): {e}")
     exit(1)
 
-# Simple home route
+
 @app.route('/')
 def home():
-    return "Telegram Streaming Proxy is Running. Use /api/stream/<file_id> to stream.", 200
+    return "Telegram Streaming Proxy is Running. Use /api/stream/<chat_id>/<message_id> to stream.", 200
 
-# 🎯 FINAL FILE STREAMING ENDPOINT (Uses FILE_ID directly)
-@app.route("/api/stream/<file_id>")
-def stream_file_by_id(file_id):
-    print(f"Request received for File ID: {file_id}")
+# Chat ID aur Message ID se stream (String ID supported)
+@app.route("/api/stream/<chat_id>/<message_id>")
+def stream_file_by_id(chat_id, message_id):
+    print(f"Request received for Chat ID: {chat_id}, Message ID: {message_id}")
     
     try:
-        # 🔥 FIX: File metadata nikalne ki koshish nahi karenge, seedhe stream karenge
-        # Temporary details set kar rahe hain taaki streaming shuru ho sake
-        file_name = "streaming_file.mkv" 
-        mime_type = 'video/x-matroska'
+        # File Details nikaalo
+        message = bot.get_messages(
+            chat_id=chat_id, # String (@username) support
+            message_ids=int(message_id)
+        )
         
-        # NOTE: Content-Length ko remove kiya gaya hai ya 0 set kiya gaya hai,
-        # taaki browser file ka size jaane bina stream shuru kar de.
+        if not message or (not message.video and not message.document):
+            return "404 Error: File not found or message does not contain a file.", 404
         
-        # 2. File ko stream karne ka generator function
+        file_info = message.video or message.document
+        file_name = file_info.file_name or "streaming_file.mkv"
+        file_size = file_info.file_size
+        mime_type = file_info.mime_type or 'video/x-matroska'
+        
+        # Range Handling
+        range_header = request.headers.get('Range')
+        start_byte, end_byte = 0, file_size - 1
+        status_code = 200
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Disposition": f"inline; filename=\"{file_name}\"",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size) # Size ab mil gayi hai
+        }
+
+        if range_header:
+            range_match = re.search(r'bytes=(\d+)-(\d*)', range_header)
+            if range_match:
+                start_byte = int(range_match.group(1))
+                if range_match.group(2):
+                    end_byte = int(range_match.group(2))
+                
+                status_code = 206 
+                content_length = end_byte - start_byte + 1
+                headers['Content-Length'] = str(content_length)
+                headers['Content-Range'] = f'bytes {start_byte}-{end_byte}/{file_size}'
+        
+        # File ko stream karne ka generator function
         def generate():
-            # bot.stream_media ko seedhe FILE_ID string de rahe hain
-            # Isse Pyrogram seedhe download shuru kar dega.
-            for chunk in bot.stream_media(file_id): 
-                yield chunk
+            offset = start_byte
+            limit = end_byte - start_byte + 1 if end_byte is not None else file_size - start_byte
+            
+            try:
+                for chunk in bot.stream_media(
+                    message, 
+                    offset=offset, 
+                    limit=limit
+                ): 
+                    yield chunk
+            except Exception as e:
+                print(f"Stream generation error: {e}")
+                raise
         
-        # 3. HTTP Response set karein
         return Response(
             generate(),
-            mimetype=mime_type, 
-            headers={
-                "Content-Disposition": f"attachment; filename=\"{file_name}\"",
-                "Content-Length": "0", # Ya koi bada number, ya hata do. Hum 0 set kar rahe hain.
-                "Accept-Ranges": "bytes"
-            }
+            status=status_code,
+            headers=headers
         )
-
-    # Specific error handling for the file ID issues
-    except FileIdInvalid as e:
-        print(f"CRITICAL FILE ID ERROR: File ID galat hai ya expired hai. {e}")
-        return "400 Bad Request: File ID galat hai ya expired ho gayi hai.", 400
-
+        
     except Exception as e:
-        print(f"Unforeseen Error during streaming: {e}")
-        # Aakhri koshish: Agar streaming mein koi error aaye, toh error message mein file ID bhi de sakte hain
+        print(f"Error in stream_file_by_id: {e}")
         return "500 Internal Server Error: Streaming failed.", 500
 
-# Yeh function Gunicorn run karega
+
+# Render/Heroku mein gunicorn se chalaenge
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=os.environ.get("PORT", 8080))
     
