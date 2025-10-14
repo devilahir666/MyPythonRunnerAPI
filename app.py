@@ -6,15 +6,16 @@ from pyrogram.errors import FileReferenceExpired, RPCError
 
 app = Flask(__name__)
 
-# --- HARDCODED KEYS (GitHub par mat daalna! Secrets use honge) ---
-# NOTE: Render par deploy karte waqt, yeh values Render Secrets mein daalni hain, 
-# code mein nahi. Lekin abhi testing ke liye rakh rahe hain.
+# --- HARDCODED KEYS (USER REQUEST KE ANUSAAR) ---
+# NOTE: Jab keys ko hardcode kiya jata hai, toh Render environment variables
+# ko ignore kar diya jata hai.
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57"
-STRING_SESSION = "BQFphUUAHgXd4GHGzpOXFKX1kJ-ScusfrHGvhk_cbLGN5DDa9-IMe08WtUU1pzFuz1DGy9jnwMMsJo2FnUZSQHtXNsaBm-UFA22ZqN4htnHk4-qdkACNpeTXayIcvETMsH97WLERuVr9t9NJTMpVkg4zD57b4CkmLljxqwt81_WQS99wTKzW7uDj412nIFudlHddsqDyiw2aXKM8Ar1yPKXUkpf_xTfrzUEKkrVppdTRdattUqahoq0zrlAUYxUCB-iTipGWJDeDrszD_QsOQs9p2F9wYP44s6Zx9nznRXcv0EmO0MHjH-Zmew6yHcBAcu_r0-b7wShXytzzJ9EySBRul_2KwAAAAHq-0sgAA"
+# NAYEE, POORI STRING_SESSION YAHAN USE KI GAYI HAI
+STRING_SESSION = "BQFphUUAHgXd4GHGzpOXFKX1kJ-ScusfrHGvhk_cbLGN5DDa9-IMe08WtUU1pzFuz1DGy9jnwMMsJo2FnUZSQHtXNsaBm-UFA22ZqN4htnHk4-qdkACNpeTXayIcvETMsH97WLERuVr9t9NJTMpVkg4zD57b4CkmLljxqwt81_WQS99wTKzW7uDj412nIFudlHddsqDyiw2aXKM8Ar1yPKXUkpf_xTfrzUEKkrVppdTRdattUqahoq0zrlAUYxUCB-iTipGWJDeDrszD_QsOQs9p2F9WwYP44s6Zx9nznRXcv0EmO0MHjH-Zmew6yHcBAcu_r0-b7wShXytzzJ9EySBRul_2KwAAAAHq-0sgAA"
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
 
-# Pyrogram Sync Client
+# Pyrogram Sync Client ko initialize karna
 try:
     if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN]):
         print("CRITICAL ERROR: Keys are missing or empty.")
@@ -27,9 +28,11 @@ try:
         api_hash=API_HASH, 
         bot_token=BOT_TOKEN
     )
+    # Start karne se pehle string session decode hogi
     bot.start() 
     print("Telegram Client Connected Successfully!")
 except Exception as e:
+    # Agar string session decode nahi hui, toh yahan error aayega
     print(f"Connection Error during bot.start(): {e}")
     exit(1)
 
@@ -44,9 +47,9 @@ def stream_file_by_id(chat_id, message_id):
     print(f"Request received for Chat ID: {chat_id}, Message ID: {message_id}")
     
     try:
-        # File Details nikaalo
+        # File Details nikaalo (String ID supported)
         message = bot.get_messages(
-            chat_id=chat_id, # String (@username) support
+            chat_id=chat_id, 
             message_ids=int(message_id)
         )
         
@@ -66,7 +69,7 @@ def stream_file_by_id(chat_id, message_id):
             "Content-Type": mime_type,
             "Content-Disposition": f"inline; filename=\"{file_name}\"",
             "Accept-Ranges": "bytes",
-            "Content-Length": str(file_size) # Size ab mil gayi hai
+            "Content-Length": str(file_size)
         }
 
         if range_header:
@@ -76,7 +79,7 @@ def stream_file_by_id(chat_id, message_id):
                 if range_match.group(2):
                     end_byte = int(range_match.group(2))
                 
-                status_code = 206 
+                status_code = 206
                 content_length = end_byte - start_byte + 1
                 headers['Content-Length'] = str(content_length)
                 headers['Content-Range'] = f'bytes {start_byte}-{end_byte}/{file_size}'
@@ -108,7 +111,5 @@ def stream_file_by_id(chat_id, message_id):
         return "500 Internal Server Error: Streaming failed.", 500
 
 
-# Render/Heroku mein gunicorn se chalaenge
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=os.environ.get("PORT", 8080))
-    
