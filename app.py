@@ -1,75 +1,102 @@
 import os
 import re
-from flask import Flask, Response, request
-from pyrogram import Client as SyncClient 
+import asyncio
+from fastapi import FastAPI, HTTPException, Request, Response
+from pyrogram import Client
 from pyrogram.errors import FileReferenceExpired, RPCError
+from starlette.background import BackgroundTask
+from typing import AsyncGenerator
 
-app = Flask(__name__)
-
-# --- HARDCODED KEYS (USER REQUEST KE ANUSAAR) ---
-# NOTE: Jab keys ko hardcode kiya jata hai, toh Render environment variables
-# ko ignore kar diya jata hai.
+# --- HARDCODED KEYS ---
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57"
-# NAYEE, POORI STRING_SESSION YAHAN USE KI GAYI HAI
 STRING_SESSION = "BQFphUUAHgXd4GHGzpOXFKX1kJ-ScusfrHGvhk_cbLGN5DDa9-IMe08WtUU1pzFuz1DGy9jnwMMsJo2FnUZSQHtXNsaBm-UFA22ZqN4htnHk4-qdkACNpeTXayIcvETMsH97WLERuVr9t9NJTMpVkg4zD57b4CkmLljxqwt81_WQS99wTKzW7uDj412nIFudlHddsqDyiw2aXKM8Ar1yPKXUkpf_xTfrzUEKkrVppdTRdattUqahoq0zrlAUYxUCB-iTipGWJDeDrszD_QsOQs9p2F9WwYP44s6Zx9nznRXcv0EmO0MHjH-Zmew6yHcBAcu_r0-b7wShXytzzJ9EySBRul_2KwAAAAHq-0sgAA"
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
 
-# Pyrogram Sync Client ko initialize karna
-try:
-    if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN]):
-        print("CRITICAL ERROR: Keys are missing or empty.")
-        exit(1)
-        
-    bot = SyncClient(
-        BOT_TOKEN.split(":")[0],
-        session_string=STRING_SESSION, 
-        api_id=int(API_ID), 
-        api_hash=API_HASH, 
-        bot_token=BOT_TOKEN
-    )
-    # Start karne se pehle string session decode hogi
-    bot.start() 
-    print("Telegram Client Connected Successfully!")
-except Exception as e:
-    # Agar string session decode nahi hui, toh yahan error aayega
-    print(f"Connection Error during bot.start(): {e}")
-    exit(1)
+# FastAPI aur Pyrogram Client ka setup
+app = FastAPI(title="Telegram Async Streamer")
+client = None # Global async client
 
+# Client ko start/stop karne ke liye hooks
+@app.on_event("startup")
+async def startup_event():
+    global client
+    try:
+        if not all([API_ID, API_HASH, STRING_SESSION, BOT_TOKEN]):
+            print("CRITICAL ERROR: Keys are missing or empty.")
+            raise Exception("Missing Environment Variables")
 
-@app.route('/')
-def home():
-    return "Telegram Streaming Proxy is Running. Use /api/stream/<chat_id>/<message_id> to stream.", 200
+        # Pyrogram Client ko ASYNC mode mein initialize karo
+        client = Client(
+            name=BOT_TOKEN.split(":")[0],
+            session_string=STRING_SESSION,
+            api_id=int(API_ID),
+            api_hash=API_HASH,
+            bot_token=BOT_TOKEN,
+            no_updates=True
+        )
+        await client.start()
+        print("Telegram Async Client Connected Successfully!")
+    except Exception as e:
+        print(f"Connection Error during client.start(): {e}")
+        # Agar connection fail ho toh app ko start hone se roko
+        raise
 
-# Chat ID aur Message ID se stream (String ID supported)
-@app.route("/api/stream/<chat_id>/<message_id>")
-def stream_file_by_id(chat_id, message_id):
+@app.on_event("shutdown")
+async def shutdown_event():
+    global client
+    if client:
+        await client.stop()
+        print("Telegram Async Client Stopped.")
+
+@app.get("/")
+async def home():
+    return {"message": "Telegram Async Streaming Proxy is Running. Use /api/stream/{chat_id}/{message_id} to stream."}
+
+# Generator function for streaming
+async def stream_generator(message, offset: int, limit: int) -> AsyncGenerator[bytes, None]:
+    try:
+        # ASYNC client.stream_media() use ho raha hai
+        async for chunk in client.stream_media(
+            message,
+            offset=offset,
+            limit=limit
+        ):
+            yield chunk
+    except Exception as e:
+        print(f"Stream generation error: {e}")
+        # Agar stream fail ho toh generator ko band kar do
+        return
+
+# 🎯 FINAL ASYNC ROUTE
+@app.get("/api/stream/{chat_id}/{message_id}")
+async def stream_file_by_id(chat_id: str, message_id: int, request: Request):
     print(f"Request received for Chat ID: {chat_id}, Message ID: {message_id}")
     
     try:
-        # File Details nikaalo (String ID supported)
-        message = bot.get_messages(
-            chat_id=chat_id, 
-            message_ids=int(message_id)
+        # ASYNC client.get_messages() use ho raha hai
+        message = await client.get_messages(
+            chat_id=chat_id,
+            message_ids=message_id
         )
-        
+
         if not message or (not message.video and not message.document):
-            return "404 Error: File not found or message does not contain a file.", 404
+            raise HTTPException(status_code=404, detail="File not found or message does not contain a file.")
         
         file_info = message.video or message.document
         file_name = file_info.file_name or "streaming_file.mkv"
         file_size = file_info.file_size
         mime_type = file_info.mime_type or 'video/x-matroska'
-        
+
         # Range Handling
         range_header = request.headers.get('Range')
         start_byte, end_byte = 0, file_size - 1
         status_code = 200
+        
         headers = {
             "Content-Type": mime_type,
             "Content-Disposition": f"inline; filename=\"{file_name}\"",
             "Accept-Ranges": "bytes",
-            "Content-Length": str(file_size)
         }
 
         if range_header:
@@ -83,33 +110,20 @@ def stream_file_by_id(chat_id, message_id):
                 content_length = end_byte - start_byte + 1
                 headers['Content-Length'] = str(content_length)
                 headers['Content-Range'] = f'bytes {start_byte}-{end_byte}/{file_size}'
-        
-        # File ko stream karne ka generator function
-        def generate():
-            offset = start_byte
-            limit = end_byte - start_byte + 1 if end_byte is not None else file_size - start_byte
-            
-            try:
-                for chunk in bot.stream_media(
-                    message, 
-                    offset=offset, 
-                    limit=limit
-                ): 
-                    yield chunk
-            except Exception as e:
-                print(f"Stream generation error: {e}")
-                raise
-        
+        else:
+             headers['Content-Length'] = str(file_size)
+
+        limit = end_byte - start_byte + 1 if end_byte is not None else file_size - start_byte
+
+        # Final Async Response
         return Response(
-            generate(),
-            status=status_code,
-            headers=headers
+            content=stream_generator(message, start_byte, limit),
+            status_code=status_code,
+            headers=headers,
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error in stream_file_by_id: {e}")
-        return "500 Internal Server Error: Streaming failed.", 500
-
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=os.environ.get("PORT", 8080))
+        raise HTTPException(status_code=500, detail="Internal Server Error: Streaming failed.")
