@@ -1,4 +1,4 @@
 Flask
-pyrogram==2.0.106
+pyrogram
+cryptg
 gunicorn
-TgCrypto
