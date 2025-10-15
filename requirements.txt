@@ -3,3 +3,4 @@ python-multipart
 uvicorn
 telethon
 gunicorn
+httpx
