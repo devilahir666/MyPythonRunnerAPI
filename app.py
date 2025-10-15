@@ -21,7 +21,7 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # Security ke liye inhe Environment Variables mein daalna behtar hota hai.
 API_ID = 29243403
 API_HASH = "1adc479f6027488cdd13259028056b73" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGn7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
@@ -31,6 +31,9 @@ TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
 # Buffer 4 chunks (Low RAM usage)
 BUFFER_CHUNK_COUNT = 4 
+
+# ** NEW: PINGER CONFIGURATION **
+PINGER_DELAY_SECONDS = 120 # 2 minutes (Render Free Tier ke liye optimal)
 
 # 🌟 JUGAD 1: Metadata Caching Setup
 FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -42,15 +45,29 @@ client: TelegramClient = None
 resolved_channel_entity: Optional[Any] = None 
 entity_resolve_lock = asyncio.Lock()
 
+async def keep_alive_pinger():
+    """Render Free Tier ko inactive hone se rokne ke liye har 2 minute mein heartbeat bhejta hai."""
+    logging.info(f"PINGER: Background keep-alive task started (interval: {PINGER_DELAY_SECONDS}s).")
+    while True:
+        await asyncio.sleep(PINGER_DELAY_SECONDS)
+        # Heartbeat log, jo server activity ko maintain rakhta hai
+        logging.info("PINGER: Heartbeat sent (Server is Active).")
+        # Optional: Yahan aap internal root endpoint ko call kar sakte hain 
+        # lekin sirf log message kaafi hona chahiye.
+
 
 @app.on_event("startup")
 async def startup_event():
     global client
     logging.info("Attempting to connect Telegram Client (Startup: Lazy Channel Resolve)...")
     
+    # ** NEW: PINGER TASK SCHEDULE **
+    # Pinger task ko background mein schedule kiya gaya hai, taaki yeh main app ko block na kare
+    asyncio.create_task(keep_alive_pinger())
+    logging.info("PINGER: Keep-alive task scheduled.")
+    
     try:
-        # **UPDATED: FloodWaitError ko automatic handle karne ke liye retry_delay=1 add kiya gaya hai.**
-        # Agar FloodWaitError aata hai toh client Telegram API द्वारा दिए गए समय तक wait karega.
+        # FloodWaitError ko automatic handle karne ke liye retry_delay=1 add kiya gaya hai।
         client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH, retry_delay=1)
         await client_instance.start(bot_token=BOT_TOKEN)
         client = client_instance
@@ -62,7 +79,6 @@ async def startup_event():
              client = None
 
     except FloodWaitError as e:
-        # Agar startup mein FloodWaitError aaye, toh zyada wait time ke liye log karein
         logging.error(f"FATAL TELETHON CONNECTION ERROR: FloodWaitError: A wait of {e.seconds} seconds is required. Client will remain disconnected until next startup attempt.")
         client = None
     except Exception as e:
@@ -97,7 +113,7 @@ async def root():
 
 
 async def _get_or_resolve_channel_entity():
-    """Channel entity ko resolve karta hai aur global variable mein cache karta hai (Lazy Caching)."""
+    """Channel entity ko resolve karta hai aur global variable mein cache karta hai (Lazy Caching)।"""
     global resolved_channel_entity
     
     if resolved_channel_entity:
@@ -129,7 +145,7 @@ async def download_producer(
     queue: asyncio.Queue
 ):
     """
-    Background mein Telegram se data download karke queue mein daalta hai (Producer).
+    Background mein Telegram se data download karke queue mein daalta hai (Producer)।
     """
     offset = start_offset
     
@@ -138,7 +154,6 @@ async def download_producer(
             limit = min(chunk_size, end_offset - offset + 1)
             
             # Telethon se download ki request
-            # Ab iske andar FloodWaitError khud handle ho jayega retry_delay=1 ke karan
             async for chunk in client_instance.iter_download(
                 file_entity, 
                 offset=offset,
@@ -155,8 +170,6 @@ async def download_producer(
                  break 
         
     except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
-        # Agar yahan FloodWaitError aata hai toh woh RPCError ke through catch hoga, 
-        # lekin client level par handling zyada effective hai.
         logging.error(f"PRODUCER CRITICAL ERROR: {type(e).__name__} during download.")
     except Exception as e:
         logging.error(f"PRODUCER UNHANDLED EXCEPTION: {e}")
@@ -168,7 +181,7 @@ async def download_producer(
 
 async def file_iterator(file_entity_for_download, file_size, range_header, request: Request):
     """
-    Queue se chunks nikalta hai aur FastAPI ko stream karta hai (Consumer).
+    Queue se chunks nikalta hai aur FastAPI ko stream karta hai (Consumer)।
     """
     start = 0
     end = file_size - 1
@@ -346,5 +359,4 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         return StreamingResponse(
             file_iterator(file_entity_for_download, file_size, None, request),
             headers=headers
-            )
-
+        )
