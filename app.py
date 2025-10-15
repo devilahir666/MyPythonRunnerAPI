@@ -6,10 +6,13 @@ from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
 from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError
-from telethon.tl.types import InputDocument # Permanent ID se entity banane ke liye
+from telethon.tl.types import InputDocument
 import logging
 import time 
 from typing import Dict, Any, Optional
+
+# 🌟 NEW: For Real Supabase API Calls (Isko Render/hosting environment mein install karna padega)
+import httpx 
 # ------------------------------------------
 
 # Set up logging 
@@ -19,65 +22,79 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRK Kv98" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
-# --- CONFIGURATION (OPTIMIZED FOR LOW RAM & CACHING) ---
-# NOTE: Channel entity is now mainly for client authorization, not fetching messages.
-TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00' 
-OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size (Low latency)
-BUFFER_CHUNK_COUNT = 4 # 4 chunks (Low RAM usage)
 
-# 🌟 JUGAD: Metadata Caching Setup (Keyed by Telegram Permanent File ID)
-# Cache ki key ab permanent file ID string hogi.
+# --- 🔑 SUPABASE CONFIGURATION (MANDATORY: Fill these details) ---
+# 1. Project URL (Jaise: https://abcde12345.supabase.co)
+SUPABASE_URL = "YOUR_SUPABASE_PROJECT_URL"  
+
+# 2. Project Anon Key (Settings -> API mein milegi)
+SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY" 
+
+# 3. Tumhari table ka naam (Tumhare case mein yeh 'database' hai)
+SUPABASE_TABLE = "database" 
+# -----------------------------------------------------------------
+
+
+# --- OTHER CONFIGURATION ---
+OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 
+BUFFER_CHUNK_COUNT = 4
+
+# Metadata Caching Setup (Keyed by Telegram Permanent File ID)
 FILE_METADATA_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
+CACHE_TTL = 3600 # 60 minutes
+# --------------------------
 
-# 💡 MOCK DATABASE: Tumhe yeh function apni async Supabase query se badalna hoga.
-# Ab DB mein sirf Permanent File ID, Size aur Title hai.
-MOCK_SUPABASE_DATA = {
-    # UUID jo public URL mein use hoga
-    "a1b2c3d4-stream-001": {
-        "file_id": "BAACAgEAAxkBAAMCaO0vt5pQ2NRhkCaf5Dhk2PUM9p8AAgUCAALeo2FHyL80nhjJ1W4eBA", # permanent_file_id
-        "file_size": 50000000, 
-        "title": "Big_Buck_Bunny.mp4"
-    },
-    "e5f6g7h8-stream-002": {
-        "file_id": "BAACAgEAAxkBAAMCA-0vt5pQ2NRhkCaf5Dhk2PUM9p8AAgUCAALeo2FHyL80nhjJ1W4eBB",
-        "file_size": 120000000, 
-        "title": "Sintel_Movie.mkv"
-    },
-    # Tumhara diya hua UUID (MOCK data mein nahi hai, isliye error aayega)
-    "7a048f80-ce75-4eb3-828d-6f8d26b920d3": {
-         "file_id": "BAACAgEAAxkBAAPzZZ914c6kXn1t-c22h0y5l2qX36sAAk4CAAK1X1hI-o64J3K5yGAeBA",
-         "file_size": 250000000,
-         "title": "Test_File_250MB.mp4"
-    }
-}
+
+# --- REAL SUPABASE LOOKUP FUNCTION (REPLACING MOCK DATA) ---
 async def _get_data_from_supabase(file_uuid: str) -> Optional[Dict[str, Any]]:
     """
-    MOCK FUNCTION: Fetches Telegram permanent file_id, size, and title from Supabase using UUID.
+    REAL SUPABASE FUNCTION: Fetches required file metadata using the file_uuid via REST API.
     """
-    # Real world mein yahan tumhara async DB query code aayega.
-    # Tumhari query Supabase table 'database' mein 'id' column ke against 'file_uuid' ko match karegi.
-    # Aur 'file_id', 'file_size', 'title' return karegi.
-    await asyncio.sleep(0.01) # Simulating a fast DB lookup
-    
-    data = MOCK_SUPABASE_DATA.get(file_uuid)
-    if data:
-        # Dictionary keys ko map kiya gaya hai
-        return {
-            "file_id_permanent": data["file_id"],
-            "file_size": data["file_size"],
-            "title": data["title"]
-        }
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Accept": "application/json"
+    }
+    # Query: Select file_id, file_size, title where id (UUID) = file_uuid
+    params = {
+        "id": f"eq.{file_uuid}",
+        "select": "file_id,file_size,title" # Tumhare column names
+    }
+
+    try:
+        # Asynchronous HTTP call to Supabase
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status() # Agar koi HTTP error ho to raise karo
+
+        data = response.json()
+        
+        if data and len(data) > 0:
+            row = data[0]
+            # Mapping Supabase column names to the expected format for streaming logic
+            return {
+                "file_id_permanent": row["file_id"], 
+                "file_size": row["file_size"],
+                "title": row["title"]
+            }
+        
+    except httpx.HTTPStatusError as e:
+        logging.error(f"Supabase HTTP Error: {e.response.status_code} - {e.response.text}")
+    except Exception as e:
+        logging.error(f"Supabase Connection Error: {e}")
+
     return None
-# -------------------------------
+
+# -----------------------------------------------------------
+
 
 app = FastAPI(title="Telethon UUID Streaming Proxy")
 client: TelegramClient = None
-resolved_channel_entity: Optional[Any] = None 
 entity_resolve_lock = asyncio.Lock()
 
 
@@ -119,8 +136,6 @@ async def root():
 
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
-
-# _get_or_resolve_channel_entity, download_producer, and file_iterator functions remain the same as they handle the stream logic.
 
 async def download_producer(
     client_instance: TelegramClient,
@@ -245,17 +260,13 @@ async def stream_file_by_uuid(file_uuid: str, request: Request):
         logging.info(f"Cache MISS/EXPIRED. Resolving Input Document for Permanent File ID.")
 
         try:
-            # Telethon ka jugad: Permanent File ID string ko Document entity mein resolve karna.
-            # get_input_document Telethon ka internal method hai jo string ID ko download ke liye 
-            # zaroori object (InputDocument) mein convert karta hai.
-            # file_id=None isliye kiya kyunki string ID pass kar rahe hain.
+            # get_input_document Permanent File ID string ko download ke liye zaroori object mein convert karta hai.
             file_entity_for_download = await client.get_input_document(permanent_file_id)
             
             if not isinstance(file_entity_for_download, InputDocument):
-                 # Agar resolution failed hua toh generic error
                  raise ValueError("Failed to resolve permanent file ID to InputDocument.")
 
-            # 3. Cache the live Telethon Entity (InputDocument is enough for iter_download)
+            # 3. Cache the live Telethon Entity 
             FILE_METADATA_CACHE[permanent_file_id] = {
                 'entity': file_entity_for_download,
                 'timestamp': current_time 
