@@ -5,11 +5,11 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
-from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError
+# FloodWaitError handling ke liye FloodWaitError import kiya
+from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError
 import logging
 import time # Time module cache ke liye
 from typing import Dict, Any, Optional
-# pprint ki zarurat nahi hai, hata diya
 # ------------------------------------------
 
 # Set up logging 
@@ -34,7 +34,7 @@ BUFFER_CHUNK_COUNT = 4
 
 # 🌟 JUGAD 1: Metadata Caching Setup
 FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
-CACHE_TTL = 3600 # 60 minutes tak cache rakhenge (File references normally expire nahi hote itni jaldi)
+CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
 # -------------------------------
 
 app = FastAPI(title="Telethon Async Streaming Proxy")
@@ -49,7 +49,9 @@ async def startup_event():
     logging.info("Attempting to connect Telegram Client (Startup: Lazy Channel Resolve)...")
     
     try:
-        client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+        # **UPDATED: FloodWaitError ko automatic handle karne ke liye retry_delay=1 add kiya gaya hai.**
+        # Agar FloodWaitError aata hai toh client Telegram API द्वारा दिए गए समय तक wait karega.
+        client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH, retry_delay=1)
         await client_instance.start(bot_token=BOT_TOKEN)
         client = client_instance
         
@@ -59,6 +61,10 @@ async def startup_event():
              logging.error("Telegram Client failed to authorize user or bot.")
              client = None
 
+    except FloodWaitError as e:
+        # Agar startup mein FloodWaitError aaye, toh zyada wait time ke liye log karein
+        logging.error(f"FATAL TELETHON CONNECTION ERROR: FloodWaitError: A wait of {e.seconds} seconds is required. Client will remain disconnected until next startup attempt.")
+        client = None
     except Exception as e:
         logging.error(f"FATAL TELETHON CONNECTION ERROR: {type(e).__name__}: {e}. Client will remain disconnected.")
         client = None 
@@ -74,7 +80,15 @@ async def shutdown_event():
 async def root():
     chunk_mb = OPTIMAL_CHUNK_SIZE // (1024 * 1024)
     total_buffer_mb = chunk_mb * BUFFER_CHUNK_COUNT
-    if client and await client.is_user_authorized():
+    # Check if client is None before calling is_user_authorized
+    is_authorized = False
+    if client:
+        try:
+            is_authorized = await client.is_user_authorized()
+        except Exception:
+            is_authorized = False
+            
+    if is_authorized:
         status_msg = f"Streaming Proxy Active. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB). Metadata Cache TTL: {CACHE_TTL//60} mins."
     else:
         status_msg = "Client is NOT connected/authorized. (503 Service Unavailable)."
@@ -124,6 +138,7 @@ async def download_producer(
             limit = min(chunk_size, end_offset - offset + 1)
             
             # Telethon se download ki request
+            # Ab iske andar FloodWaitError khud handle ho jayega retry_delay=1 ke karan
             async for chunk in client_instance.iter_download(
                 file_entity, 
                 offset=offset,
@@ -135,12 +150,14 @@ async def download_producer(
                 offset += len(chunk)
 
             if offset <= end_offset:
+                 # Agar loop break ho gaya aur target nahi pahucha, toh error log karein
                  logging.error(f"PRODUCER BREAK: Offset reached {offset}, target was {end_offset}. Stopping.")
                  break 
         
     except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
+        # Agar yahan FloodWaitError aata hai toh woh RPCError ke through catch hoga, 
+        # lekin client level par handling zyada effective hai.
         logging.error(f"PRODUCER CRITICAL ERROR: {type(e).__name__} during download.")
-        # Note: Agar FileReferenceExpiredError aaye, toh agla request cache miss karega aur naya reference fetch karega
     except Exception as e:
         logging.error(f"PRODUCER UNHANDLED EXCEPTION: {e}")
     
@@ -209,12 +226,13 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
 
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
-    """Telegram Message ID se file stream karta hai."""
+    """Telegram Message ID se file stream karta hai।"""
     global client
     if client is None:
         raise HTTPException(status_code=503, detail="Telegram Client not connected.")
         
-    resolved_entity = await _get_or_resolve_channel_entity()
+    # Is call ke andar bhi FloodWaitError automatic handle ho jayega
+    resolved_entity = await _get_or_resolve_channel_entity() 
         
     logging.info(f"Request received for Channel '{TEST_CHANNEL_ENTITY_USERNAME}', Message ID: {message_id}")
     
@@ -233,7 +251,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     cached_data = FILE_METADATA_CACHE.get(file_id_int)
     
     if cached_data and (current_time - cached_data['timestamp']) < CACHE_TTL:
-        # Cache Hit: Data cache mein hai aur valid hai. API call skip.
+        # Cache Hit: Data cache mein hai aur valid hai। API call skip।
         logging.info(f"Cache HIT for message {file_id_int}. Skipping Telegram API call.")
         file_size = cached_data['size']
         file_title = cached_data['title']
@@ -245,6 +263,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
         # --- METADATA FETCHING (Same as before) ---
         try:
+            # Is call mein bhi FloodWaitError automatic handle ho jayega
             message = await client.get_messages(resolved_entity, ids=file_id_int) 
             
             media_entity = None
@@ -328,3 +347,4 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             file_iterator(file_entity_for_download, file_size, None, request),
             headers=headers
             )
+
