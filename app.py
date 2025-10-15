@@ -10,6 +10,8 @@ from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, F
 import logging
 import time # Time module cache ke liye
 from typing import Dict, Any, Optional
+# --- Naya import: Self-ping ke liye httpx ---
+import httpx 
 # ------------------------------------------
 
 # Set up logging 
@@ -21,7 +23,7 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # Security ke liye inhe Environment Variables mein daalna behtar hota hai.
 API_ID = 29243403
 API_HASH = "1adc479f6027488cdd13259028056b73" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGn7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
@@ -35,6 +37,9 @@ BUFFER_CHUNK_COUNT = 4
 # ** NEW: PINGER CONFIGURATION **
 PINGER_DELAY_SECONDS = 120 # 2 minutes (Render Free Tier ke liye optimal)
 
+# 🚨 RENDER SELF-PING URL (Aapka Public URL) 🚨
+PUBLIC_SELF_PING_URL = "https://telegram-stream-proxy-x63x.onrender.com/"
+
 # 🌟 JUGAD 1: Metadata Caching Setup
 FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
 CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
@@ -46,14 +51,30 @@ resolved_channel_entity: Optional[Any] = None
 entity_resolve_lock = asyncio.Lock()
 
 async def keep_alive_pinger():
-    """Render Free Tier ko inactive hone se rokne ke liye har 2 minute mein heartbeat bhejta hai."""
-    logging.info(f"PINGER: Background keep-alive task started (interval: {PINGER_DELAY_SECONDS}s).")
-    while True:
-        await asyncio.sleep(PINGER_DELAY_SECONDS)
-        # Heartbeat log, jo server activity ko maintain rakhta hai
-        logging.info("PINGER: Heartbeat sent (Server is Active).")
-        # Optional: Yahan aap internal root endpoint ko call kar sakte hain 
-        # lekin sirf log message kaafi hona chahiye.
+    """
+    Render Free Tier ko inactive hone se rokne ke liye har 2 minute mein 
+    apne hi PUBLIC endpoint par heartbeat (self-ping) bhejta hai.
+    """
+    logging.info(f"PINGER: Background keep-alive task started (interval: {PINGER_DELAY_SECONDS}s). Target: {PUBLIC_SELF_PING_URL}")
+    
+    # httpx.AsyncClient ek session maintain karta hai
+    async with httpx.AsyncClient(timeout=10) as client_http: 
+        while True:
+            await asyncio.sleep(PINGER_DELAY_SECONDS)
+            try:
+                # Khud ke root endpoint ko hit karo (Real network activity generate hogi)
+                response = await client_http.get(PUBLIC_SELF_PING_URL) 
+                
+                if response.status_code == 200:
+                    logging.info(f"PINGER: Self-Heartbeat sent successfully (Status: {response.status_code}).")
+                else:
+                    logging.warning(f"PINGER: Self-Heartbeat FAILED (Status: {response.status_code}). Response text: {response.text[:50]}...")
+            except httpx.HTTPError as e:
+                 # Network ya connection error
+                 logging.error(f"PINGER: Self-Heartbeat HTTP Error: {type(e).__name__} during request.")
+            except Exception as e:
+                 # Dusri koi bhi error
+                 logging.error(f"PINGER: Self-Heartbeat General Error: {type(e).__name__}: {e}")
 
 
 @app.on_event("startup")
