@@ -29,10 +29,11 @@ SESSION_NAME = None
 
 # --- 🔑 SUPABASE CONFIGURATION (MANDATORY: Fill these details) ---
 # 1. Project URL (Jaise: https://abcde12345.supabase.co)
-SUPABASE_URL = "YOUR_SUPABASE_PROJECT_URL"  
+SUPABASE_URL = "https://eorilcomhitkpkthfdes.supabase.co"  
 
 # 2. Project Anon Key (Settings -> API mein milegi)
-SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY" 
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVvcmlsY29taGl0a3BrdGhmZGVzIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Mzk3NTc2MCwiZXhwIjoyMDY5NTUxNzYwfQ.ePTpfwz_qZ3B92JU8wJFxiBWEvQfFfc3yvAxcxYzNfA"
+
 
 # 3. Tumhari table ka naam (Tumhare case mein yeh 'database' hai)
 SUPABASE_TABLE = "database" 
