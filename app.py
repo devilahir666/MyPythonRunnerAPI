@@ -16,22 +16,21 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnU7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
 # --- CONFIGURATION ---
 TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 16 # 16 MB chunk size
-# Buffer mein 4 chunks (64MB) aage se download hoke ready rahenge
-BUFFER_CHUNK_COUNT = 4 
+# 🚀 FINAL FIX: Buffer ko 10 chunks (160MB) kiya gaya hai smooth streaming ke liye
+BUFFER_CHUNK_COUNT = 10 
 # -------------------------------
 
 app = FastAPI(title="Telethon Async Streaming Proxy")
 client: TelegramClient = None
-# Ab resolved_channel_entity startup par nahi, pehli request par resolve hoga (Lazy Caching)
+# resolved_channel_entity ab pehli request par resolve hoga (Lazy Caching)
 resolved_channel_entity = None 
-# Lock for resolving entity to prevent race conditions on first request
 entity_resolve_lock = asyncio.Lock()
 
 
@@ -41,7 +40,6 @@ async def startup_event():
     logging.info("Attempting to connect Telegram Client (Startup: Lazy Channel Resolve)...")
     
     try:
-        # Client connect karo, lekin channel entity resolve abhi nahi karenge
         client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         await client_instance.start(bot_token=BOT_TOKEN)
         client = client_instance
@@ -77,13 +75,10 @@ async def _get_or_resolve_channel_entity():
     """Channel entity ko resolve karta hai aur global variable mein cache karta hai (Lazy Caching)."""
     global resolved_channel_entity
     
-    # Agar pehle se resolved hai, to turant wapas kar do
     if resolved_channel_entity:
         return resolved_channel_entity
 
-    # Agar resolved nahi hai, to lock lagao taaki sirf ek hi request resolution kare
     async with entity_resolve_lock:
-        # Lock ke andar dobara check karo (race condition se bachne ke liye)
         if resolved_channel_entity:
             return resolved_channel_entity
             
@@ -158,7 +153,7 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
             start = 0
             end = file_size - 1
 
-    # Buffer queue banao (Deep Buffer of 4 chunks)
+    # Buffer queue banao (Deep Buffer of 10 chunks)
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
     # Producer task ko background mein chalao
