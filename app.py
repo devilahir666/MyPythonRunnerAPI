@@ -1,170 +1,229 @@
-import re
+# --- TELEGRAM STREAMING SERVER (CLOUD READY - HARDCODED KEYS) ---
+
+# Import necessary libraries
 import asyncio
-from fastapi import FastAPI, HTTPException, Request 
-from starlette.responses import StreamingResponse 
+# os library ki ab zaroorat nahi hai kyonki hum keys hardcode kar rahe hain
+from fastapi import FastAPI, Request, HTTPException, status
+from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
-from telethon.tl.types import InputDocumentFileLocation
-from telethon.errors.rpcerrorlist import FileReferenceExpiredError
-from typing import AsyncGenerator, Optional
+from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError
+import logging
+import pprint 
 
-# db.py se Supabase function import karein
-from db import get_movie_data 
+# Set up logging 
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logging.getLogger('telethon').setLevel(logging.WARNING)
 
-# --- 🔥 FRESH HARDCODED TELEGRAM KEYS 🔥 ---
-# Telethon client ko connect karne ke liye
+# --- TELEGRAM CREDENTIALS (HARDCODED) ---
+# NOTE: Ye keys ab code me hi rahengi jaisa aapne bola hai.
 API_ID = 23692613
-API_HASH = "8bb69956d38a8226433186a199695f57"
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98"
-SESSION_NAME = "stream_bot_session"
+API_HASH = "8bb69956d38a8226433186a199695f57" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnU7N5F_U87nR9FRwKv98" 
+# CRITICAL FIX for Cloud: Session file save nahi hogi, isliye None.
+SESSION_NAME = None 
+# ------------------------------------------
 
-# Streaming ke liye bada chunk size (4MB)
-CHUNK_SIZE_BYTES = 4 * 1024 * 1024 
+# --- CONFIGURATION ---
+TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
+# -------------------------------
 
-# FastAPI aur Telethon Client ka setup
-app = FastAPI(title="Stable Telethon Streaming Proxy (Supabase)")
-client: Optional[TelegramClient] = None 
+app = FastAPI(title="Telethon Hardcoded Key Streaming Proxy")
+client: TelegramClient = None
+resolved_channel_entity = None 
 
-# ✅ FIX: Deployment Stability. Agar client fail ho toh server chalta rahe.
 @app.on_event("startup")
 async def startup_event():
-    global client
+    global client, resolved_channel_entity
+    logging.info("Attempting to connect Telegram Client...")
+    
     try:
-        if not all([API_ID, API_HASH, BOT_TOKEN]):
-            print("CRITICAL ERROR: API keys or BOT_TOKEN are missing.")
-            return # Credentials missing, client will remain None
-
-        # Bot Client se connect kar rahe hain
-        telethon_client = TelegramClient(
-            SESSION_NAME, 
-            API_ID, 
-            API_HASH
-        ).start(bot_token=BOT_TOKEN)
+        # TelethonClient ab SESSION_NAME=None ke saath stateless mode mein connect hoga
+        client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+        await client_instance.start(bot_token=BOT_TOKEN)
+        client = client_instance
         
-        # client object ko await karna zaroori hai
-        client = await telethon_client
-        print("Telegram Bot Client (Telethon) Connected Successfully!")
+        if client and await client.is_user_authorized():
+             logging.info("Telegram Client connected and authorized successfully!")
+             
+             logging.info(f"Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME}...")
+             resolved_channel_entity = await client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+             logging.info(f"Channel resolved successfully! Type: {type(resolved_channel_entity).__name__}")
+             
+        else:
+             logging.error("Telegram Client failed to authorize user or bot.")
+             client = None
+
     except Exception as e:
-        # Agar Telegram connect nahi ho paata, toh client ko None rakho aur server ko chalne do.
-        print(f"CRITICAL: Connection Error during client.start(). Client will be UNAVAILABLE: {e}")
-        client = None
+        logging.error(f"FATAL TELETHON CONNECTION ERROR: {type(e).__name__}: {e}. Client will remain disconnected.")
+        client = None 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global client
     if client:
+        logging.info("Closing Telegram Client connection...")
         await client.disconnect()
-        print("Telegram Bot Client Disconnected.")
 
 @app.get("/")
-async def home():
-    return {"message": "Telethon Streaming Proxy is Running. Use /api/stream/movie/{uuid} to stream."}
+async def root():
+    if client and await client.is_user_authorized():
+        status_msg = f"Streaming Proxy Active. Streaming from channel: {TEST_CHANNEL_ENTITY_USERNAME}"
+    else:
+        status_msg = "Client is NOT connected/authorized. (503 Service Unavailable)."
 
-# Generator function for streaming
-async def stream_generator(file_id: str, file_size: int, offset: int, limit: int) -> AsyncGenerator[bytes, None]:
-    global client 
-    max_retries = 3
+    return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
-    # Permanent File ID se file object banana
-    try:
-        # Telethon file_id ko InputDocumentFileLocation mein decode karta hai
-        file_location = await client.get_document(file_id)
-        
-        if not file_location:
-            raise ValueError(f"Could not resolve file ID: {file_id}")
-            
-    except Exception as e:
-        # Agar yahan error aaya to client ko batao ki file hi nahi mili
-        print(f"Error resolving permanent File ID: {e}")
-        # Telethon file reference ko resolve nahi kar paya.
-        raise HTTPException(status_code=404, detail=f"File ID Resolution Failed or Client Uninitialized.") 
-
-    # Streaming start karna
-    for attempt in range(max_retries):
+async def file_iterator(file_entity_for_download, file_size, range_header, request: Request):
+    """File ko Telegram se chunko mein download karta hai aur stream karta hai."""
+    
+    start = 0
+    end = file_size - 1
+    
+    if range_header:
         try:
-            chunk_generator = client.iter_content(
-                file_location,
+            range_value = range_header.split('=')[1]
+            if '-' in range_value:
+                start_str, end_str = range_value.split('-')
+                start = int(start_str) if start_str else 0
+                end = int(end_str) if end_str else file_size - 1
+            logging.info(f"Streaming Range: bytes={start}-{end}")
+        except Exception as e:
+            logging.warning(f"Invalid Range header format: {e}")
+            start = 0
+            end = file_size - 1
+    
+    chunk_size = 1024 * 1024 * 2 # 2 MB chunk size
+    offset = start
+
+    try:
+        while offset <= end:
+            limit = min(chunk_size, end - offset + 1)
+            
+            # Working logic: Direct Document/Video object use karna
+            async for chunk in client.iter_download(
+                file_entity_for_download, 
                 offset=offset,
                 limit=limit,
-                chunk_size=CHUNK_SIZE_BYTES
-            )
-            
-            async for chunk in chunk_generator:
+                chunk_size=chunk_size
+            ):
+                if await request.is_disconnected():
+                    logging.info("Client disconnected during stream (Terminating iterator).")
+                    return 
+                
                 yield chunk
-            return
-        
-        except FileReferenceExpiredError:
-            print(f"FileReferenceExpiredError on attempt {attempt + 1}. Telethon should automatically refresh...")
-            await asyncio.sleep(1) 
-            if attempt >= max_retries - 1:
-                # Agar saare retries fail ho gaye, toh error raise karo
-                raise
-        
-        except asyncio.CancelledError:
-            print("Stream cancelled by client (CancelledError).")
-            return
-            
-        except Exception as e:
-            print(f"Stream generation internal error: {e}")
-            raise
+                offset += len(chunk)
 
-# 🎯 FINAL ASYNC ROUTE: Supabase ID (UUID) se streaming
-@app.get("/api/stream/movie/{movie_uuid}")
-async def stream_file_by_db_id(movie_uuid: str, request: Request):
-    global client 
-    print(f"Request received for Movie UUID: {movie_uuid}")
-    
-    # ✅ FIX: Agar client initialize nahi hua toh 503 error do 
-    if not client:
-        # Yeh error tab aata hai jab startup_event mein connection fail ho
-        raise HTTPException(status_code=503, detail="Service Unavailable: Telegram client not connected/initialized.")
+            if offset <= end:
+                 logging.error(f"STREAM BREAK: Offset reached {offset}, target was {end}. Stopping.")
+                 break 
 
-    # 1. Supabase se Permanent File ID, Title, aur Size fetch karo
-    movie_data = get_movie_data(movie_uuid)
-    
-    if not movie_data:
-        raise HTTPException(status_code=404, detail=f"Movie data not found for UUID: {movie_uuid} in Supabase.")
-        
-    encoded_file_id = movie_data['file_id']
-    file_name = movie_data['title'] + ".mkv" 
-    file_size = movie_data['file_size']
-    mime_type = 'video/x-matroska' 
-
-    # 2. Range Handling Logic
-    range_header = request.headers.get('Range')
-    start_byte, end_byte = 0, file_size - 1
-    status_code = 200
-    
-    headers = {
-        "Content-Type": mime_type,
-        "Content-Disposition": f"inline; filename=\"{file_name}\"",
-        "Accept-Ranges": "bytes",
-    }
-
-    content_length = file_size
-    if range_header:
-        range_match = re.search(r'bytes=(\d+)-(\d*)', range_header)
-        if range_match:
-            start_byte = int(range_match.group(1))
-            if range_match.group(2):
-                end_byte = int(range_match.group(2))
-            
-            status_code = 206
-            content_length = end_byte - start_byte + 1
-            headers['Content-Range'] = f'bytes {start_byte}-{end_byte}/{file_size}'
-    
-    headers['Content-Length'] = str(content_length)
-
-    limit = content_length 
-
-    # 3. StreamingResponse
-    try:
-        return StreamingResponse(
-            content=stream_generator(encoded_file_id, file_size, start_byte, limit),
-            status_code=status_code,
-            headers=headers,
-            media_type=mime_type
-        )
+    except (FileReferenceExpiredError, RPCError, TimeoutError, asyncio.CancelledError, AuthKeyError) as e:
+        logging.error(f"CRITICAL STREAMING ERROR CAUGHT: {type(e).__name__} during download.")
+        return 
     except Exception as e:
-        print(f"Error setting up StreamingResponse: {e}")
-        # Agar streaming fail ho to 500 internal server error de
-        raise HTTPException(status_code=500, detail="Internal Server Error: Streaming failed.")
+        logging.error(f"UNHANDLED EXCEPTION IN ITERATOR: {e}")
+        return 
+
+@app.get("/api/stream/movie/{message_id}")
+async def stream_file_by_message_id(message_id: str, request: Request):
+    """Telegram Message ID se file stream karta hai."""
+    global client, resolved_channel_entity
+    if client is None or resolved_channel_entity is None:
+        raise HTTPException(status_code=503, detail="Telegram Client not connected or channel not resolved.")
+        
+    logging.info(f"Request received for Channel '{TEST_CHANNEL_ENTITY_USERNAME}', Message ID: {message_id}")
+    
+    try:
+        file_id_int = int(message_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Message ID must be a valid integer.")
+
+    file_entity_for_download = None 
+    file_size = 0
+    file_title = f"movie_{message_id}.mkv" # Default title
+
+    # --- METADATA FETCHING: Working logic se Document ya Video reference nikalo ---
+    try:
+        logging.info(f"Fetching metadata for message {file_id_int} from resolved entity.")
+        
+        message = await client.get_messages(resolved_channel_entity, ids=file_id_int) 
+        
+        media_entity = None
+        media_type = None
+        
+        if message and message.media:
+            if hasattr(message.media, 'document') and message.media.document:
+                media_entity = message.media.document
+                media_type = "Document"
+            elif hasattr(message.media, 'video') and message.media.video:
+                media_entity = message.media.video
+                media_type = "Video"
+        
+        if media_entity:
+            file_size = media_entity.size
+            file_entity_for_download = media_entity # Direct object pass
+            
+            # File title extraction
+            if media_entity.attributes:
+                for attr in media_entity.attributes:
+                    if hasattr(attr, 'file_name'):
+                        file_title = attr.file_name
+                        break
+            
+            logging.info(f"Metadata SUCCESS via {media_type}: Title='{file_title}', Size={file_size} bytes.")
+        else:
+            logging.error(f"Metadata FAILED: Message {file_id_int} not found or no suitable media (Document/Video).")
+            if message:
+                logging.error("--- DIAGNOSTIC DUMP: MESSAGE OBJECT DETAILS ---")
+                logging.error(pprint.pformat(message.to_dict()))
+                logging.error("--- END DUMP ---")
+            raise HTTPException(status_code=404, detail="File not found in the specified channel or is not a streamable media type.")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"METADATA RESOLUTION ERROR: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
+    
+    
+    # 2. Range Handling aur Headers
+    range_header = request.headers.get("range")
+    
+    content_type = "video/mp4" 
+    if file_title.endswith(".mkv"): content_type = "video/x-matroska"
+    elif file_title.endswith(".mp4"): content_type = "video/mp4"
+
+    if range_header:
+        try:
+            start_range = int(range_header.split('=')[1].split('-')[0])
+        except:
+            start_range = 0
+            
+        content_length = file_size - start_range
+        
+        headers = {
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Content-Range": f"bytes {start_range}-{file_size - 1}/{file_size}",
+            "Content-Disposition": f"inline; filename=\"{file_title}\"",
+            "Connection": "keep-alive"
+        }
+        return StreamingResponse(
+            file_iterator(file_entity_for_download, file_size, range_header, request),
+            status_code=status.HTTP_206_PARTIAL_CONTENT,
+            headers=headers
+        )
+    else:
+        # Full content request
+        headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f"inline; filename=\"{file_title}\"",
+            "Connection": "keep-alive"
+        }
+        return StreamingResponse(
+            file_iterator(file_entity_for_download, file_size, None, request),
+            headers=headers
+        )
