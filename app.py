@@ -1,4 +1,4 @@
-# --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING) ---
+# --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING & LAZY CACHING) ---
 
 # Import necessary libraries
 import asyncio
@@ -16,36 +16,38 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnU7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
 # --- CONFIGURATION ---
 TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 16 # 16 MB chunk size
-# Buffer mein 2 chunks (32MB) aage se download hoke ready rahenge
-BUFFER_CHUNK_COUNT = 2 
+# Buffer mein 4 chunks (64MB) aage se download hoke ready rahenge
+BUFFER_CHUNK_COUNT = 4 
 # -------------------------------
 
 app = FastAPI(title="Telethon Async Streaming Proxy")
 client: TelegramClient = None
+# Ab resolved_channel_entity startup par nahi, pehli request par resolve hoga (Lazy Caching)
 resolved_channel_entity = None 
+# Lock for resolving entity to prevent race conditions on first request
+entity_resolve_lock = asyncio.Lock()
+
 
 @app.on_event("startup")
 async def startup_event():
-    global client, resolved_channel_entity
-    logging.info("Attempting to connect Telegram Client...")
+    global client
+    logging.info("Attempting to connect Telegram Client (Startup: Lazy Channel Resolve)...")
     
     try:
+        # Client connect karo, lekin channel entity resolve abhi nahi karenge
         client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         await client_instance.start(bot_token=BOT_TOKEN)
         client = client_instance
         
         if client and await client.is_user_authorized():
              logging.info("Telegram Client connected and authorized successfully!")
-             resolved_channel_entity = await client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-             logging.info(f"Channel resolved successfully! Type: {type(resolved_channel_entity).__name__}")
-             
         else:
              logging.error("Telegram Client failed to authorize user or bot.")
              client = None
@@ -64,11 +66,35 @@ async def shutdown_event():
 @app.get("/")
 async def root():
     if client and await client.is_user_authorized():
-        status_msg = f"Streaming Proxy Active. Streaming from channel: {TEST_CHANNEL_ENTITY_USERNAME}"
+        status_msg = f"Streaming Proxy Active. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Buffer Size: {BUFFER_CHUNK_COUNT}x{OPTIMAL_CHUNK_SIZE // (1024 * 1024)}MB."
     else:
         status_msg = "Client is NOT connected/authorized. (503 Service Unavailable)."
 
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
+
+
+async def _get_or_resolve_channel_entity():
+    """Channel entity ko resolve karta hai aur global variable mein cache karta hai (Lazy Caching)."""
+    global resolved_channel_entity
+    
+    # Agar pehle se resolved hai, to turant wapas kar do
+    if resolved_channel_entity:
+        return resolved_channel_entity
+
+    # Agar resolved nahi hai, to lock lagao taaki sirf ek hi request resolution kare
+    async with entity_resolve_lock:
+        # Lock ke andar dobara check karo (race condition se bachne ke liye)
+        if resolved_channel_entity:
+            return resolved_channel_entity
+            
+        logging.info(f"LAZY RESOLVE: Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME}...")
+        try:
+            resolved_channel_entity = await client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+            logging.info(f"LAZY RESOLVE SUCCESS: Channel resolved and cached.")
+            return resolved_channel_entity
+        except Exception as e:
+            logging.error(f"LAZY RESOLVE FAILED: Could not resolve channel entity: {e}")
+            raise HTTPException(status_code=500, detail="Could not resolve target channel entity.")
 
 
 async def download_producer(
@@ -80,8 +106,7 @@ async def download_producer(
     queue: asyncio.Queue
 ):
     """
-    Background mein Telegram se data download karke queue mein daalta hai.
-    Yeh producer task consumer (file_iterator) se alag chalta hai.
+    Background mein Telegram se data download karke queue mein daalta hai (Producer).
     """
     offset = start_offset
     
@@ -89,14 +114,14 @@ async def download_producer(
         while offset <= end_offset:
             limit = min(chunk_size, end_offset - offset + 1)
             
-            # Telethon se download ki request (working logic)
+            # Telethon se download ki request
             async for chunk in client_instance.iter_download(
                 file_entity, 
                 offset=offset,
                 limit=limit,
                 chunk_size=chunk_size
             ):
-                # Chunk ko queue mein daalo (Jahan se consumer uthayega)
+                # Chunk ko queue mein daalo
                 await queue.put(chunk)
                 offset += len(chunk)
 
@@ -116,7 +141,7 @@ async def download_producer(
 
 async def file_iterator(file_entity_for_download, file_size, range_header, request: Request):
     """
-    Queue se chunks nikalta hai aur FastAPI ko stream karta hai.
+    Queue se chunks nikalta hai aur FastAPI ko stream karta hai (Consumer).
     """
     start = 0
     end = file_size - 1
@@ -128,13 +153,12 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
                 start_str, end_str = range_value.split('-')
                 start = int(start_str) if start_str else 0
                 end = int(end_str) if end_str else file_size - 1
-            logging.info(f"Streaming Range: bytes={start}-{end}")
         except Exception as e:
             logging.warning(f"Invalid Range header format: {e}")
             start = 0
             end = file_size - 1
 
-    # Buffer queue banao
+    # Buffer queue banao (Deep Buffer of 4 chunks)
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
     # Producer task ko background mein chalao
@@ -169,8 +193,7 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
         if not producer_task.done():
             producer_task.cancel()
         
-        # Ab koi error nahi aayega, kyunki producer abhi bhi chal raha hoga
-        # humne ensure kar liya ki producer_task.cancel() call ho
+        # Wait for the producer to finish cancellation/completion cleanly
         if not producer_task.cancelled():
              await asyncio.gather(producer_task, return_exceptions=True)
 
@@ -178,9 +201,12 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
     """Telegram Message ID se file stream karta hai."""
-    global client, resolved_channel_entity
-    if client is None or resolved_channel_entity is None:
-        raise HTTPException(status_code=503, detail="Telegram Client not connected or channel not resolved.")
+    global client
+    if client is None:
+        raise HTTPException(status_code=503, detail="Telegram Client not connected.")
+        
+    # Pehli request par channel entity resolve/cache karo
+    resolved_entity = await _get_or_resolve_channel_entity()
         
     logging.info(f"Request received for Channel '{TEST_CHANNEL_ENTITY_USERNAME}', Message ID: {message_id}")
     
@@ -193,11 +219,12 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     file_size = 0
     file_title = f"movie_{message_id}.mkv" # Default title
 
-    # --- METADATA FETCHING: Document ya Video reference nikalo ---
+    # --- METADATA FETCHING ---
     try:
         logging.info(f"Fetching metadata for message {file_id_int} from resolved entity.")
         
-        message = await client.get_messages(resolved_channel_entity, ids=file_id_int) 
+        # Ab hum resolved_entity use kar rahe hain
+        message = await client.get_messages(resolved_entity, ids=file_id_int) 
         
         media_entity = None
         media_type = None
@@ -240,7 +267,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-    # Baaki headers same rahenge, bas iterator change hoga
     if range_header:
         try:
             start_range = int(range_header.split('=')[1].split('-')[0])
