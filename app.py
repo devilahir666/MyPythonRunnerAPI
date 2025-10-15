@@ -18,7 +18,7 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # NOTE: Ye keys ab code me hi rahengi jaisa aapne bola hai.
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnU7N5F_U87nR9FRwKv98" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
 # CRITICAL FIX for Cloud: Session file save nahi hogi, isliye None.
 SESSION_NAME = None 
 # ------------------------------------------
