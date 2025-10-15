@@ -14,17 +14,22 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
+# 🚨 WARNING: Yeh credentials code mein hardcode kiye gaye hain. 
+# Security ke liye inhe Environment Variables mein daalna behtar hota hai.
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57" 
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (LOW RAM OPTIMIZATION) ---
 TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
-OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 16 # 16 MB chunk size
-# 🚀 FINAL FIX: Buffer ko 10 chunks (160MB) kiya gaya hai smooth streaming ke liye
-BUFFER_CHUNK_COUNT = 10 
+# 🌟 FIX 1: Chunk size 16MB se kam karke 2MB kiya gaya. 
+# Chhote chunks jaldi download honge aur streaming lag kam hoga.
+OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
+# 🌟 FIX 2: Buffer ko 10 chunks se kam karke 4 chunks kiya gaya. 
+# Total buffer ab sirf 8MB hai, jo 512MB RAM ke liye behtar hai.
+BUFFER_CHUNK_COUNT = 4 
 # -------------------------------
 
 app = FastAPI(title="Telethon Async Streaming Proxy")
@@ -63,8 +68,10 @@ async def shutdown_event():
 
 @app.get("/")
 async def root():
+    chunk_mb = OPTIMAL_CHUNK_SIZE // (1024 * 1024)
+    total_buffer_mb = chunk_mb * BUFFER_CHUNK_COUNT
     if client and await client.is_user_authorized():
-        status_msg = f"Streaming Proxy Active. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Buffer Size: {BUFFER_CHUNK_COUNT}x{OPTIMAL_CHUNK_SIZE // (1024 * 1024)}MB."
+        status_msg = f"Streaming Proxy Active. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB)."
     else:
         status_msg = "Client is NOT connected/authorized. (503 Service Unavailable)."
 
@@ -84,11 +91,15 @@ async def _get_or_resolve_channel_entity():
             
         logging.info(f"LAZY RESOLVE: Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME}...")
         try:
+            # client ka use karna zaroori hai
+            if client is None:
+                 raise Exception("Telegram client is not initialized.")
+                 
             resolved_channel_entity = await client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
             logging.info(f"LAZY RESOLVE SUCCESS: Channel resolved and cached.")
             return resolved_channel_entity
         except Exception as e:
-            logging.error(f"LAZY RESOLVE FAILED: Could not resolve channel entity: {e}")
+            logging.error(f"LAZY RESOLVE FAILED: Could not resolve target channel entity: {e}")
             raise HTTPException(status_code=500, detail="Could not resolve target channel entity.")
 
 
@@ -120,11 +131,13 @@ async def download_producer(
                 await queue.put(chunk)
                 offset += len(chunk)
 
+            # Agar loop poora ho gaya par offset target tak nahi pahuncha
             if offset <= end_offset:
                  logging.error(f"PRODUCER BREAK: Offset reached {offset}, target was {end_offset}. Stopping.")
                  break 
         
     except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
+        # File reference expire hone par download roko
         logging.error(f"PRODUCER CRITICAL ERROR: {type(e).__name__} during download.")
     except Exception as e:
         logging.error(f"PRODUCER UNHANDLED EXCEPTION: {e}")
@@ -143,17 +156,18 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
     
     if range_header:
         try:
+            # Range header ko theek se parse karo
             range_value = range_header.split('=')[1]
             if '-' in range_value:
                 start_str, end_str = range_value.split('-')
                 start = int(start_str) if start_str else 0
                 end = int(end_str) if end_str else file_size - 1
         except Exception as e:
-            logging.warning(f"Invalid Range header format: {e}")
+            logging.warning(f"Invalid Range header format: {e}. Defaulting to full stream.")
             start = 0
             end = file_size - 1
 
-    # Buffer queue banao (Deep Buffer of 10 chunks)
+    # Buffer queue banao (Optimized buffer for low RAM)
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
     # Producer task ko background mein chalao
@@ -188,9 +202,8 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
         if not producer_task.done():
             producer_task.cancel()
         
-        # Wait for the producer to finish cancellation/completion cleanly
-        if not producer_task.cancelled():
-             await asyncio.gather(producer_task, return_exceptions=True)
+        # Thoda wait karo taaki producer clean ho jaaye
+        await asyncio.gather(producer_task, return_exceptions=True)
 
 
 @app.get("/api/stream/movie/{message_id}")
@@ -261,10 +274,16 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     content_type = "video/mp4" 
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
+    # Aur bhi formats yahan add kiye ja sakte hain (e.g., .mov, .avi)
 
     if range_header:
+        # Partial Content (206) response
+        
+        # Range ko dobara calculate karo
         try:
-            start_range = int(range_header.split('=')[1].split('-')[0])
+            start_str = range_header.split('=')[1].split('-')[0]
+            start_range = int(start_str) if start_str else 0
+            # End range ki zarurat nahi, hum poori file tak jaate hain
         except:
             start_range = 0
             
@@ -274,6 +293,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             "Content-Type": content_type,
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
+            # Content-Range mein end hamesha file size - 1 hota hai
             "Content-Range": f"bytes {start_range}-{file_size - 1}/{file_size}",
             "Content-Disposition": f"inline; filename=\"{file_title}\"",
             "Connection": "keep-alive"
@@ -284,7 +304,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             headers=headers
         )
     else:
-        # Full content request
+        # Full content request (200) response
         headers = {
             "Content-Type": content_type,
             "Content-Length": str(file_size),
