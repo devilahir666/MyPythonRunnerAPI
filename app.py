@@ -19,8 +19,8 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
 # 🚨 WARNING: Yeh credentials code mein hardcode kiye gaye hain. 
 # Security ke liye inhe Environment Variables mein daalna behtar hota hai.
-API_ID = 23692613
-API_HASH = "8bb69956d38a8226433186a199695f57" 
+API_ID = 29243403
+API_HASH = "1adc479f6027488cdd13259028056b73" 
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
