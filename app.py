@@ -1,4 +1,4 @@
-# --- TELEGRAM STREAMING SERVER (PERMANENT FILE ID & CACHING OPTIMIZED) ---
+# --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING & LAZY CACHING) ---
 
 # Import necessary libraries
 import asyncio
@@ -6,13 +6,10 @@ from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
 from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError
-from telethon.tl.types import InputDocument
 import logging
-import time 
+import time # Time module cache ke liye
 from typing import Dict, Any, Optional
-
-# 🌟 NEW: For Real Supabase API Calls (Isko Render/hosting environment mein install karna padega)
-import httpx 
+# pprint ki zarurat nahi hai, hata diya
 # ------------------------------------------
 
 # Set up logging 
@@ -20,89 +17,36 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
-API_ID = 29243403
-API_HASH = "1adc479f6027488cdd13259028056b73" 
+# 🚨 WARNING: Yeh credentials code mein hardcode kiye gaye hain. 
+# Security ke liye inhe Environment Variables mein daalna behtar hota hai.
+API_ID = 23692613
+API_HASH = "8bb69956d38a8226433186a199695f57" 
 BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
+# --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
+TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
+# Chunk size 2MB (Low latency)
+OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
+# Buffer 4 chunks (Low RAM usage)
+BUFFER_CHUNK_COUNT = 4 
 
-# --- 🔑 SUPABASE CONFIGURATION (MANDATORY: Fill these details) ---
-# 1. Project URL (Jaise: https://abcde12345.supabase.co)
-SUPABASE_URL = "https://eorilcomhitkpkthfdes.supabase.co"  
+# 🌟 JUGAD 1: Metadata Caching Setup
+FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
+CACHE_TTL = 3600 # 60 minutes tak cache rakhenge (File references normally expire nahi hote itni jaldi)
+# -------------------------------
 
-# 2. Project Anon Key (Settings -> API mein milegi)
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVvcmlsY29taGl0a3BrdGhmZGVzIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1Mzk3NTc2MCwiZXhwIjoyMDY5NTUxNzYwfQ.ePTpfwz_qZ3B92JU8wJFxiBWEvQfFfc3yvAxcxYzNfA"
-
-
-# 3. Tumhari table ka naam (Tumhare case mein yeh 'database' hai)
-SUPABASE_TABLE = "database" 
-# -----------------------------------------------------------------
-
-
-# --- OTHER CONFIGURATION ---
-OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 
-BUFFER_CHUNK_COUNT = 4
-
-# Metadata Caching Setup (Keyed by Telegram Permanent File ID)
-FILE_METADATA_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 3600 # 60 minutes
-# --------------------------
-
-
-# --- REAL SUPABASE LOOKUP FUNCTION (REPLACING MOCK DATA) ---
-async def _get_data_from_supabase(file_uuid: str) -> Optional[Dict[str, Any]]:
-    """
-    REAL SUPABASE FUNCTION: Fetches required file metadata using the file_uuid via REST API.
-    """
-    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Accept": "application/json"
-    }
-    # Query: Select file_id, file_size, title where id (UUID) = file_uuid
-    params = {
-        "id": f"eq.{file_uuid}",
-        "select": "file_id,file_size,title" # Tumhare column names
-    }
-
-    try:
-        # Asynchronous HTTP call to Supabase
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(url, headers=headers, params=params)
-            response.raise_for_status() # Agar koi HTTP error ho to raise karo
-
-        data = response.json()
-        
-        if data and len(data) > 0:
-            row = data[0]
-            # Mapping Supabase column names to the expected format for streaming logic
-            return {
-                "file_id_permanent": row["file_id"], 
-                "file_size": row["file_size"],
-                "title": row["title"]
-            }
-        
-    except httpx.HTTPStatusError as e:
-        logging.error(f"Supabase HTTP Error: {e.response.status_code} - {e.response.text}")
-    except Exception as e:
-        logging.error(f"Supabase Connection Error: {e}")
-
-    return None
-
-# -----------------------------------------------------------
-
-
-app = FastAPI(title="Telethon UUID Streaming Proxy")
+app = FastAPI(title="Telethon Async Streaming Proxy")
 client: TelegramClient = None
+resolved_channel_entity: Optional[Any] = None 
 entity_resolve_lock = asyncio.Lock()
 
 
 @app.on_event("startup")
 async def startup_event():
     global client
-    logging.info("Attempting to connect Telegram Client...")
+    logging.info("Attempting to connect Telegram Client (Startup: Lazy Channel Resolve)...")
     
     try:
         client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -131,11 +75,35 @@ async def root():
     chunk_mb = OPTIMAL_CHUNK_SIZE // (1024 * 1024)
     total_buffer_mb = chunk_mb * BUFFER_CHUNK_COUNT
     if client and await client.is_user_authorized():
-        status_msg = f"Streaming Proxy Active. Chunk Size: {chunk_mb}MB. Buffer: {total_buffer_mb}MB. Cache Key: Permanent File ID."
+        status_msg = f"Streaming Proxy Active. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB). Metadata Cache TTL: {CACHE_TTL//60} mins."
     else:
         status_msg = "Client is NOT connected/authorized. (503 Service Unavailable)."
 
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
+
+
+async def _get_or_resolve_channel_entity():
+    """Channel entity ko resolve karta hai aur global variable mein cache karta hai (Lazy Caching)."""
+    global resolved_channel_entity
+    
+    if resolved_channel_entity:
+        return resolved_channel_entity
+
+    async with entity_resolve_lock:
+        if resolved_channel_entity:
+            return resolved_channel_entity
+            
+        logging.info(f"LAZY RESOLVE: Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME}...")
+        try:
+            if client is None:
+                 raise Exception("Telegram client is not initialized.")
+                 
+            resolved_channel_entity = await client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+            logging.info(f"LAZY RESOLVE SUCCESS: Channel resolved and cached.")
+            return resolved_channel_entity
+        except Exception as e:
+            logging.error(f"LAZY RESOLVE FAILED: Could not resolve target channel entity: {e}")
+            raise HTTPException(status_code=500, detail="Could not resolve target channel entity.")
 
 
 async def download_producer(
@@ -155,12 +123,14 @@ async def download_producer(
         while offset <= end_offset:
             limit = min(chunk_size, end_offset - offset + 1)
             
+            # Telethon se download ki request
             async for chunk in client_instance.iter_download(
                 file_entity, 
                 offset=offset,
                 limit=limit,
                 chunk_size=chunk_size
             ):
+                # Chunk ko queue mein daalo
                 await queue.put(chunk)
                 offset += len(chunk)
 
@@ -170,10 +140,12 @@ async def download_producer(
         
     except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
         logging.error(f"PRODUCER CRITICAL ERROR: {type(e).__name__} during download.")
+        # Note: Agar FileReferenceExpiredError aaye, toh agla request cache miss karega aur naya reference fetch karega
     except Exception as e:
         logging.error(f"PRODUCER UNHANDLED EXCEPTION: {e}")
     
     finally:
+        # Download poora hone par Sentinel (None) daal do
         await queue.put(None)
 
 
@@ -196,16 +168,21 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
             start = 0
             end = file_size - 1
 
+    # Buffer queue banao (Optimized buffer for low RAM)
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
+    # Producer task ko background mein chalao
     producer_task = asyncio.create_task(
         download_producer(client, file_entity_for_download, start, end, OPTIMAL_CHUNK_SIZE, queue)
     )
     
     try:
+        # Consumer loop: Queue se chunks nikal kar yield karo
         while True:
+            # wait for data from the producer
             chunk = await queue.get()
             
+            # None sentinel means the download is complete or failed
             if chunk is None:
                 break
                 
@@ -222,72 +199,101 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
         logging.error(f"CONSUMER UNHANDLED EXCEPTION: {e}")
 
     finally:
+        # Ensure the background producer task is cleaned up
         if not producer_task.done():
             producer_task.cancel()
+        
+        # Thoda wait karo taaki producer clean ho jaaye
         await asyncio.gather(producer_task, return_exceptions=True)
-# -------------------------------------------------------------
 
 
-@app.get("/api/stream/movie/{file_uuid}")
-async def stream_file_by_uuid(file_uuid: str, request: Request):
-    """Supabase UUID se file stream karta hai."""
+@app.get("/api/stream/movie/{message_id}")
+async def stream_file_by_message_id(message_id: str, request: Request):
+    """Telegram Message ID se file stream karta hai."""
     global client
     if client is None:
         raise HTTPException(status_code=503, detail="Telegram Client not connected.")
         
-    # 1. Supabase/DB Lookup
-    db_data = await _get_data_from_supabase(file_uuid)
-    if not db_data:
-        # Agar DB mein UUID nahi mila, toh 404 error
-        raise HTTPException(status_code=404, detail=f"File not found for UUID: {file_uuid} in Supabase.")
+    resolved_entity = await _get_or_resolve_channel_entity()
+        
+    logging.info(f"Request received for Channel '{TEST_CHANNEL_ENTITY_USERNAME}', Message ID: {message_id}")
     
-    file_size = db_data['file_size']
-    file_title = db_data['title']
-    permanent_file_id = db_data['file_id_permanent']
-    
+    try:
+        file_id_int = int(message_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Message ID must be a valid integer.")
+
+    file_size = 0
+    file_title = f"movie_{message_id}.mkv" # Default title
     file_entity_for_download = None 
     
-    # --- CACHING LOGIC (Keyed by Permanent File ID) ---
+    
+    # 🌟 JUGAD 2: Check Caching
     current_time = time.time()
-    cached_data = FILE_METADATA_CACHE.get(permanent_file_id)
+    cached_data = FILE_METADATA_CACHE.get(file_id_int)
     
     if cached_data and (current_time - cached_data['timestamp']) < CACHE_TTL:
-        # 🚀 Cache Hit: Sabse tez path!
-        logging.info(f"Cache HIT for Permanent File ID. Streaming instantly from memory.")
+        # Cache Hit: Data cache mein hai aur valid hai. API call skip.
+        logging.info(f"Cache HIT for message {file_id_int}. Skipping Telegram API call.")
+        file_size = cached_data['size']
+        file_title = cached_data['title']
         file_entity_for_download = cached_data['entity']
         
     else:
-        # Cache Miss/Expired: Telegram API call to get live Document Entity (sirf ek baar)
-        logging.info(f"Cache MISS/EXPIRED. Resolving Input Document for Permanent File ID.")
-
+        # Cache Miss/Expired: API se naya data fetch karo
+        logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata...")
+        
+        # --- METADATA FETCHING (Same as before) ---
         try:
-            # get_input_document Permanent File ID string ko download ke liye zaroori object mein convert karta hai.
-            file_entity_for_download = await client.get_input_document(permanent_file_id)
+            message = await client.get_messages(resolved_entity, ids=file_id_int) 
             
-            if not isinstance(file_entity_for_download, InputDocument):
-                 raise ValueError("Failed to resolve permanent file ID to InputDocument.")
+            media_entity = None
+            if message and message.media:
+                if hasattr(message.media, 'document') and message.media.document:
+                    media_entity = message.media.document
+                elif hasattr(message.media, 'video') and message.media.video:
+                    media_entity = message.media.video
+            
+            if media_entity:
+                file_size = media_entity.size
+                file_entity_for_download = media_entity # Direct object pass
+                
+                if media_entity.attributes:
+                    for attr in media_entity.attributes:
+                        if hasattr(attr, 'file_name'):
+                            file_title = attr.file_name
+                            break
+                
+                # 🌟 JUGAD 3: Cache the fetched data
+                FILE_METADATA_CACHE[file_id_int] = {
+                    'size': file_size,
+                    'title': file_title,
+                    'entity': file_entity_for_download,
+                    'timestamp': current_time # Kab cache kiya gaya
+                }
+                logging.info(f"Metadata fetched and CACHED successfully for {file_id_int}.")
+            else:
+                logging.error(f"Metadata FAILED: Message {file_id_int} not found or no suitable media.")
+                raise HTTPException(status_code=404, detail="File not found in the specified channel or is not a streamable media type.")
 
-            # 3. Cache the live Telethon Entity 
-            FILE_METADATA_CACHE[permanent_file_id] = {
-                'entity': file_entity_for_download,
-                'timestamp': current_time 
-            }
-            logging.info(f"Input Document resolved and CACHED successfully for Permanent File ID.")
-
+        except HTTPException:
+            raise
         except Exception as e:
-            logging.error(f"TELEGRAM RESOLUTION ERROR: {type(e).__name__}: {e}. Permanent File ID may be invalid or expired.")
-            FILE_METADATA_CACHE.pop(permanent_file_id, None) 
-            raise HTTPException(status_code=500, detail="Internal error resolving Permanent File ID from Telegram.")
+            logging.error(f"METADATA RESOLUTION ERROR: {type(e).__name__}: {e}")
+            # Cache se entry hata do agar error aaye
+            FILE_METADATA_CACHE.pop(file_id_int, None) 
+            raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
     
-    # 4. Range Handling aur Headers
+    # 2. Range Handling aur Headers (Remains the same)
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
-    if file_title.lower().endswith(".mkv"): content_type = "video/x-matroska"
-    elif file_title.lower().endswith(".mp4"): content_type = "video/mp4"
+    if file_title.endswith(".mkv"): content_type = "video/x-matroska"
+    elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
     if range_header:
+        # Partial Content (206) response
         try:
             start_str = range_header.split('=')[1].split('-')[0]
             start_range = int(start_str) if start_str else 0
@@ -310,6 +316,7 @@ async def stream_file_by_uuid(file_uuid: str, request: Request):
             headers=headers
         )
     else:
+        # Full content request (200) response
         headers = {
             "Content-Type": content_type,
             "Content-Length": str(file_size),
@@ -320,4 +327,4 @@ async def stream_file_by_uuid(file_uuid: str, request: Request):
         return StreamingResponse(
             file_iterator(file_entity_for_download, file_size, None, request),
             headers=headers
-        )
+            )
