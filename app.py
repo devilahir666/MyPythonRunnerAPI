@@ -1,4 +1,4 @@
-# --- TELEGRAM STREAMING SERVER (CLOUD READY - HARDCODED KEYS) ---
+# --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING) ---
 
 # Import necessary libraries
 import asyncio
@@ -16,17 +16,18 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnU7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
 # --- CONFIGURATION ---
 TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
-# 16 MB chunk size set kiya gaya hai for maximum speed.
-OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 16 
+OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 16 # 16 MB chunk size
+# Buffer mein 2 chunks (32MB) aage se download hoke ready rahenge
+BUFFER_CHUNK_COUNT = 2 
 # -------------------------------
 
-app = FastAPI(title="Telethon Hardcoded Key Streaming Proxy")
+app = FastAPI(title="Telethon Async Streaming Proxy")
 client: TelegramClient = None
 resolved_channel_entity = None 
 
@@ -42,8 +43,6 @@ async def startup_event():
         
         if client and await client.is_user_authorized():
              logging.info("Telegram Client connected and authorized successfully!")
-             
-             logging.info(f"Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME}...")
              resolved_channel_entity = await client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
              logging.info(f"Channel resolved successfully! Type: {type(resolved_channel_entity).__name__}")
              
@@ -71,9 +70,54 @@ async def root():
 
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
-async def file_iterator(file_entity_for_download, file_size, range_header, request: Request):
-    """File ko Telegram se chunko mein download karta hai aur stream karta hai."""
+
+async def download_producer(
+    client_instance: TelegramClient,
+    file_entity, 
+    start_offset: int, 
+    end_offset: int, 
+    chunk_size: int, 
+    queue: asyncio.Queue
+):
+    """
+    Background mein Telegram se data download karke queue mein daalta hai.
+    Yeh producer task consumer (file_iterator) se alag chalta hai.
+    """
+    offset = start_offset
     
+    try:
+        while offset <= end_offset:
+            limit = min(chunk_size, end_offset - offset + 1)
+            
+            # Telethon se download ki request (working logic)
+            async for chunk in client_instance.iter_download(
+                file_entity, 
+                offset=offset,
+                limit=limit,
+                chunk_size=chunk_size
+            ):
+                # Chunk ko queue mein daalo (Jahan se consumer uthayega)
+                await queue.put(chunk)
+                offset += len(chunk)
+
+            if offset <= end_offset:
+                 logging.error(f"PRODUCER BREAK: Offset reached {offset}, target was {end_offset}. Stopping.")
+                 break 
+        
+    except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
+        logging.error(f"PRODUCER CRITICAL ERROR: {type(e).__name__} during download.")
+    except Exception as e:
+        logging.error(f"PRODUCER UNHANDLED EXCEPTION: {e}")
+    
+    finally:
+        # Download poora hone par Sentinel (None) daal do
+        await queue.put(None)
+
+
+async def file_iterator(file_entity_for_download, file_size, range_header, request: Request):
+    """
+    Queue se chunks nikalta hai aur FastAPI ko stream karta hai.
+    """
     start = 0
     end = file_size - 1
     
@@ -89,39 +133,47 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
             logging.warning(f"Invalid Range header format: {e}")
             start = 0
             end = file_size - 1
+
+    # Buffer queue banao
+    queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
-    # Ab humne global constant use kiya
-    chunk_size = OPTIMAL_CHUNK_SIZE 
-    offset = start
-
+    # Producer task ko background mein chalao
+    producer_task = asyncio.create_task(
+        download_producer(client, file_entity_for_download, start, end, OPTIMAL_CHUNK_SIZE, queue)
+    )
+    
     try:
-        while offset <= end:
-            limit = min(chunk_size, end - offset + 1)
+        # Consumer loop: Queue se chunks nikal kar yield karo
+        while True:
+            # wait for data from the producer
+            chunk = await queue.get()
             
-            # Working logic: Direct Document/Video object use karna
-            async for chunk in client.iter_download(
-                file_entity_for_download, 
-                offset=offset,
-                limit=limit,
-                chunk_size=chunk_size
-            ):
-                if await request.is_disconnected():
-                    logging.info("Client disconnected during stream (Terminating iterator).")
-                    return 
+            # None sentinel means the download is complete or failed
+            if chunk is None:
+                break
                 
-                yield chunk
-                offset += len(chunk)
+            if await request.is_disconnected():
+                logging.info("Client disconnected during stream (Terminating iterator).")
+                break 
 
-            if offset <= end:
-                 logging.error(f"STREAM BREAK: Offset reached {offset}, target was {end}. Stopping.")
-                 break 
-
-    except (FileReferenceExpiredError, RPCError, TimeoutError, asyncio.CancelledError, AuthKeyError) as e:
-        logging.error(f"CRITICAL STREAMING ERROR CAUGHT: {type(e).__name__} during download.")
-        return 
+            yield chunk
+            queue.task_done()
+            
+    except asyncio.CancelledError:
+        logging.info("Iterator cancelled (Client disconnect or shutdown).")
     except Exception as e:
-        logging.error(f"UNHANDLED EXCEPTION IN ITERATOR: {e}")
-        return 
+        logging.error(f"CONSUMER UNHANDLED EXCEPTION: {e}")
+
+    finally:
+        # Ensure the background producer task is cleaned up
+        if not producer_task.done():
+            producer_task.cancel()
+        
+        # Ab koi error nahi aayega, kyunki producer abhi bhi chal raha hoga
+        # humne ensure kar liya ki producer_task.cancel() call ho
+        if not producer_task.cancelled():
+             await asyncio.gather(producer_task, return_exceptions=True)
+
 
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -141,7 +193,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     file_size = 0
     file_title = f"movie_{message_id}.mkv" # Default title
 
-    # --- METADATA FETCHING: Working logic se Document ya Video reference nikalo ---
+    # --- METADATA FETCHING: Document ya Video reference nikalo ---
     try:
         logging.info(f"Fetching metadata for message {file_id_int} from resolved entity.")
         
@@ -172,10 +224,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             logging.info(f"Metadata SUCCESS via {media_type}: Title='{file_title}', Size={file_size} bytes.")
         else:
             logging.error(f"Metadata FAILED: Message {file_id_int} not found or no suitable media (Document/Video).")
-            if message:
-                logging.error("--- DIAGNOSTIC DUMP: MESSAGE OBJECT DETAILS ---")
-                logging.error(pprint.pformat(message.to_dict()))
-                logging.error("--- END DUMP ---")
             raise HTTPException(status_code=404, detail="File not found in the specified channel or is not a streamable media type.")
 
     except HTTPException:
@@ -192,6 +240,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
+    # Baaki headers same rahenge, bas iterator change hoga
     if range_header:
         try:
             start_range = int(range_header.split('=')[1].split('-')[0])
