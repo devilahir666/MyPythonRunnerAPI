@@ -2,7 +2,6 @@
 
 # Import necessary libraries
 import asyncio
-# os library ki ab zaroorat nahi hai kyonki hum keys hardcode kar rahe hain
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
@@ -15,16 +14,16 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
 # --- TELEGRAM CREDENTIALS (HARDCODED) ---
-# NOTE: Ye keys ab code me hi rahengi jaisa aapne bola hai.
 API_ID = 23692613
 API_HASH = "8bb69956d38a8226433186a199695f57" 
-BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98" 
-# CRITICAL FIX for Cloud: Session file save nahi hogi, isliye None.
+BOT_TOKEN = "8075063062:AAH8lWaA7yk6ucGnU7N5F_U87nR9FRwKv98" 
 SESSION_NAME = None 
 # ------------------------------------------
 
 # --- CONFIGURATION ---
 TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
+# 16 MB chunk size set kiya gaya hai for maximum speed.
+OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 16 
 # -------------------------------
 
 app = FastAPI(title="Telethon Hardcoded Key Streaming Proxy")
@@ -37,7 +36,6 @@ async def startup_event():
     logging.info("Attempting to connect Telegram Client...")
     
     try:
-        # TelethonClient ab SESSION_NAME=None ke saath stateless mode mein connect hoga
         client_instance = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         await client_instance.start(bot_token=BOT_TOKEN)
         client = client_instance
@@ -92,7 +90,8 @@ async def file_iterator(file_entity_for_download, file_size, range_header, reque
             start = 0
             end = file_size - 1
     
-    chunk_size = 1024 * 1024 * 2 # 2 MB chunk size
+    # Ab humne global constant use kiya
+    chunk_size = OPTIMAL_CHUNK_SIZE 
     offset = start
 
     try:
