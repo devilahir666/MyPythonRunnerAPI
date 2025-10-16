@@ -1,6 +1,7 @@
 # --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING & LAZY CACHING) ---
 
 # Import necessary libraries
+from telethon.sessions import StringSession
 import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
