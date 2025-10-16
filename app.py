@@ -15,6 +15,8 @@ from typing import Dict, Any, Optional
 import httpx 
 # --- Naye User Session ke liye imports ---
 import os 
+# 🚨 New Import for Aggressive Cleaning
+import re 
 # ------------------------------------------
 
 # Set up logging 
@@ -25,24 +27,21 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 # 🚨 WARNING: Yeh aapki private data hai. Hamesha surakshit rakhein!
 
 # 🌟 FIX: Ab hum sessions ko files se load karenge 🌟
-# String ko hataakar file paths use karein:
+# String ki jagah file paths use karein:
 SESSION_FILE_OWNER = "owner.session"
 SESSION_FILE_ADMIN = "admin.session"
-
-
-# Ye purani hardcoded session strings ki lines hata di gayi hain.
 
 CONFIGS = [
     {
         'api_id': 23692613,                                # Owner Account ki API ID
         'api_hash': "8bb69956d38a8226433186a199695f57",    # Owner Account ka API Hash
-        'session_file': SESSION_FILE_OWNER, # File path use karein
+        'session_file': SESSION_FILE_OWNER, 
         'name': 'owner_client'
     },
     {
         'api_id': 29243403,                                # Admin Account ki Doosri API ID 
         'api_hash': "1adc479f6027488cdd13259028056b73",          # Admin Account ka Doosra API Hash 
-        'session_file': SESSION_FILE_ADMIN, # File path use karein
+        'session_file': SESSION_FILE_ADMIN,
         'name': 'admin_client'
     },
 ]
@@ -53,7 +52,7 @@ global_client_counter = 0
 
 # --- Helper function to select client (Round-Robin) ---
 def get_next_client() -> Optional[TelegramClient]:
-    """Round-Robin tarike se agla client chunnta hai."""
+    """Round-Robin tarike se agla client chunnta hai।"""
     global global_client_counter
     if not client_pool:
         return None
@@ -116,8 +115,8 @@ async def keep_alive_pinger():
 
 
 # ----------------------------------------------------------------------
-# UPDATED startup_event function (File Loading Logic)
-# --- FIX FOR: ValueError: Not a valid string. ---
+# UPDATED startup_event function (Aggressive Cleaning Fix)
+# --- FINAL FIX FOR: ValueError: Not a valid string. ---
 # ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -128,20 +127,27 @@ async def startup_event():
     logging.info("PINGER: Keep-alive task scheduled.")
 
     for config in CONFIGS:
-        session_file_path = config.get('session_file') # File path nikalenge
+        session_file_path = config.get('session_file')
         client_name = config.get('name')
 
-        # 1. File se Base64 string load karo
         session_b64_string = None
+        
+        # 1. File से Base64 string load करो और Aggressively Clean करो
         try:
             with open(session_file_path, 'r') as f:
-                # File se string read karo aur uske hidden characters hata do
-                # .strip() aur .replace('\r', '') se sabhi line breaks aur whitespace hat jayenge
-                session_b64_string = f.read().strip().replace('\n', '').replace('\r', '')
-                
-            if not session_b64_string:
-                logging.error(f"FATAL CONNECTION ERROR for {client_name}: Session file {session_file_path} is empty.")
+                raw_string = f.read()
+            
+            # 🚨 AGGRESSIVE CLEANING STEP:
+            # re.sub() se sabhi non-Base64 characters (whitespace, hidden characters) ko hatao.
+            # sirf Base64 ke valid characters: A-Z, a-z, 0-9, +, /, aur = hi bachenge.
+            clean_session_string = re.sub(r'[^a-zA-Z0-9+/=]', '', raw_string)
+            
+            # Agar phir bhi string empty ho ya bahut choti ho
+            if not clean_session_string or len(clean_session_string) < 100:
+                logging.error(f"FATAL CONNECTION ERROR for {client_name}: Cleaned session string is too short or empty after processing file {session_file_path}.")
                 continue
+            
+            session_b64_string = clean_session_string
 
         except FileNotFoundError:
             logging.critical(f"FATAL CONNECTION ERROR for {client_name}: Session file {session_file_path} NOT FOUND in repo. Did you commit it?")
@@ -150,12 +156,11 @@ async def startup_event():
             logging.critical(f"FATAL CONNECTION ERROR for {client_name}: Error reading file: {e}")
             continue
             
-        # 2. Telethon se connect karo
+        # 2. Telethon से connect करो
         try:
-            # FIX: Clean string ko StringSession object mein badlo
+            # FIX: Clean string को StringSession object में बदलो
             session_obj = StringSession(session_b64_string)
             
-            # Client object banao
             client_instance = TelegramClient(
                 session=session_obj,
                 api_id=config['api_id'], 
@@ -163,7 +168,6 @@ async def startup_event():
                 retry_delay=1
             )
             
-            # User Session start
             await client_instance.start()
             
             if await client_instance.is_user_authorized():
@@ -172,6 +176,10 @@ async def startup_event():
             else:
                  logging.error(f"User Session ({client_name}) failed to authorize. (Check API ID/Hash match)")
 
+        except ValueError as e:
+            # Agar abhi bhi ValueError aaye, toh 99% session string hi galat generate hui hai.
+            logging.error(f"FATAL CONNECTION ERROR for {client_name}: ValueError: {e}. **CRITICAL: You must regenerate a new, clean Base64 session string.**")
+            continue
         except Exception as e:
             logging.error(f"FATAL CONNECTION ERROR for {client_name}: {type(e).__name__}: {e}. Client will remain disconnected.")
             continue
@@ -479,7 +487,4 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         return StreamingResponse(
             # client_instance pass kiya
-            file_iterator(client_instance, file_entity_for_download, file_size, None, request),
-            headers=headers
-        )
-                    
+            file_iterator(client_instanc
