@@ -60,7 +60,7 @@ def get_next_bot_client() -> Optional[TelegramClient]:
 # --------------------------------------------------------
 
 # --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
-TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/hPquYFblYHkxYzg1' 
+TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/+hPquYFblYHkxYzg1' 
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
 BUFFER_CHUNK_COUNT = 4 
 
@@ -213,7 +213,7 @@ async def download_producer(
     max_retries = 3
     retries = 0 # Retry counter
     
-    current_client = client_instance # 💥 FIX 3: Local client instance jisko hum switch kar sakte hain
+    current_client = client_instance # Local client instance jisko hum switch kar sakte hain
     
     try:
         initial_client_name = (await client_instance.get_me()).username if not hasattr(client_instance.session, 'filename') else client_instance.session.filename
@@ -247,16 +247,16 @@ async def download_producer(
             
         except FileReferenceExpiredError:
             
-            logging.warning(f"PRODUCER WARNING ({client_name}): FileReferenceExpiredError (Retry {retries+1}/{max_retries}). Attempting to refresh reference using Owner...")
+            logging.warning(f"PRODUCER WARNING ({client_name}): FileReferenceExpiredError (Retry {retries+1}/{max_retries}). Attempting to refresh reference using current client...") # Log updated
             
             if owner_client is None:
-                logging.error("PRODUCER FATAL: Owner client is disconnected. Cannot refresh reference.")
+                logging.error("PRODUCER FATAL: Owner client is disconnected. Cannot switch/refresh.")
                 break
 
-            # --- File Reference Refresh Logic ---
+            # --- File Reference Refresh Logic (CRITICAL FIX) ---
             try:
-                # Refresh ke liye hamesha Owner Client ka use hoga
-                refreshed_message = await owner_client.get_messages(
+                # 💥 CRITICAL FIX: Owner ki jagah current_client (Bot) use karega
+                refreshed_message = await current_client.get_messages( 
                     TEST_CHANNEL_ENTITY_USERNAME, 
                     ids=file_id_int 
                 ) 
@@ -273,12 +273,13 @@ async def download_producer(
                     
                     # File entity aur Cache ko update karo
                     file_entity = new_file_entity 
-                    FILE_METADATA_CACHE[file_id_int]['entity'] = new_file_entity
+                    # Cache ko update karne ke liye Owner client use ho sakta hai, reference use nahi hoga
+                    FILE_METADATA_CACHE[file_id_int]['entity'] = new_file_entity 
                     FILE_METADATA_CACHE[file_id_int]['timestamp'] = time.time() 
                     
-                    logging.info(f"PRODUCER: Reference refreshed successfully for {file_id_int}. Resuming download from offset {offset}.")
+                    logging.info(f"PRODUCER: Reference refreshed successfully by {client_name} for {file_id_int}. Resuming download from offset {offset}.")
                     
-                    retries = 0 # 💥 FIX 1: Success ke baad retries ko 0 par reset karo
+                    retries = 0 # Success ke baad retries ko 0 par reset karo
                     continue # Loop dobara chalu karo
                 else:
                     logging.error("PRODUCER FATAL: Failed to get new media entity during refresh.")
@@ -292,7 +293,7 @@ async def download_producer(
             retries += 1 
             if retries >= max_retries and current_client is client_instance:
                 logging.warning("PRODUCER FALLBACK: Bot client failed repeatedly. Switching to Owner Client for final download.")
-                current_client = owner_client # 💥 FIX 4: Client ko Owner par switch karo
+                current_client = owner_client # Client ko Owner par switch karo
                 retries = 0 # Owner client ke liye retries ko reset karo
                 continue
             elif retries >= max_retries:
