@@ -487,4 +487,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         return StreamingResponse(
             # client_instance pass kiya
-            file_iterator(client_instanc
+            file_iterator(client_instance, file_entity_for_download, file_size, None, request),
+            headers=headers
+        )
