@@ -60,7 +60,7 @@ def get_next_bot_client() -> Optional[TelegramClient]:
 # --------------------------------------------------------
 
 # --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
-TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/+hPquYFblYHkxYzg1' 
+TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/hPquYFblYHkxYzg1' 
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
 BUFFER_CHUNK_COUNT = 4 
 
@@ -198,7 +198,7 @@ async def root():
 
 # 🚨 Signature Change: file_id_int add kiya gaya hai 🚨
 async def download_producer(
-    client_instance: TelegramClient, 
+    client_instance: TelegramClient, # Initial client (Bot)
     file_entity, 
     file_id_int: int, # Message ID integer
     start_offset: int, 
@@ -211,20 +211,28 @@ async def download_producer(
 
     offset = start_offset
     max_retries = 3
-    retries = 0
+    retries = 0 # Retry counter
+    
+    current_client = client_instance # 💥 FIX 3: Local client instance jisko hum switch kar sakte hain
     
     try:
-        client_name = (await client_instance.get_me()).username if not hasattr(client_instance.session, 'filename') else client_instance.session.filename
+        initial_client_name = (await client_instance.get_me()).username if not hasattr(client_instance.session, 'filename') else client_instance.session.filename
     except:
-        client_name = 'client/bot'
+        initial_client_name = 'client/bot'
         
     
     while offset <= end_offset and retries < max_retries:
+        
+        try:
+            client_name = (await current_client.get_me()).username if not hasattr(current_client.session, 'filename') else current_client.session.filename
+        except:
+            client_name = 'Owner' if current_client is owner_client else initial_client_name
+
         try:
             limit = min(chunk_size, end_offset - offset + 1)
             
             # --- Download Attempt ---
-            async for chunk in client_instance.iter_download(
+            async for chunk in current_client.iter_download( # Use current_client
                 file_entity, 
                 offset=offset,
                 limit=limit,
@@ -238,8 +246,8 @@ async def download_producer(
                  break 
             
         except FileReferenceExpiredError:
-            retries += 1
-            logging.warning(f"PRODUCER WARNING ({client_name}): FileReferenceExpiredError (Retry {retries}/{max_retries}). Attempting to refresh reference using Owner...")
+            
+            logging.warning(f"PRODUCER WARNING ({client_name}): FileReferenceExpiredError (Retry {retries+1}/{max_retries}). Attempting to refresh reference using Owner...")
             
             if owner_client is None:
                 logging.error("PRODUCER FATAL: Owner client is disconnected. Cannot refresh reference.")
@@ -247,7 +255,7 @@ async def download_producer(
 
             # --- File Reference Refresh Logic ---
             try:
-                # ✅ FIX: file_entity.id (bada number) ki jagah URL se aaye file_id_int (sahi number) ka use
+                # Refresh ke liye hamesha Owner Client ka use hoga
                 refreshed_message = await owner_client.get_messages(
                     TEST_CHANNEL_ENTITY_USERNAME, 
                     ids=file_id_int 
@@ -269,16 +277,31 @@ async def download_producer(
                     FILE_METADATA_CACHE[file_id_int]['timestamp'] = time.time() 
                     
                     logging.info(f"PRODUCER: Reference refreshed successfully for {file_id_int}. Resuming download from offset {offset}.")
-                    continue # Retry ke baad while loop dobara chalega
+                    
+                    retries = 0 # 💥 FIX 1: Success ke baad retries ko 0 par reset karo
+                    continue # Loop dobara chalu karo
                 else:
                     logging.error("PRODUCER FATAL: Failed to get new media entity during refresh.")
-                    break 
-
+                    # Fallback logic neeche chalega
+                    
             except Exception as ref_e:
-                # Catch struct.error here
-                logging.error(f"PRODUCER ERROR ({client_name}): Failed to refresh reference: {type(ref_e).__name__}: {ref_e}. Retrying...")
+                # Fallback logic neeche chalega
+                logging.error(f"PRODUCER ERROR ({client_name}): Failed to refresh reference: {type(ref_e).__name__}: {ref_e}.")
+                
+            # --- FALLBACK LOGIC ---
+            retries += 1 
+            if retries >= max_retries and current_client is client_instance:
+                logging.warning("PRODUCER FALLBACK: Bot client failed repeatedly. Switching to Owner Client for final download.")
+                current_client = owner_client # 💥 FIX 4: Client ko Owner par switch karo
+                retries = 0 # Owner client ke liye retries ko reset karo
+                continue
+            elif retries >= max_retries:
+                # Agar Owner bhi fail ho gaya ya max retries bot ke saath khatam ho gaye
+                break
+            else:
+                # Agar retries baki hain aur switch nahi hua to wait karke dobara try karo
                 await asyncio.sleep(2) 
-                continue 
+                continue
         
         except (RPCError, TimeoutError, AuthKeyError) as e:
             logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download.")
@@ -288,9 +311,9 @@ async def download_producer(
             break
     
     if retries >= max_retries:
-        logging.error(f"PRODUCER FAILED: Max retries ({max_retries}) reached for file {file_id_int}.")
+        logging.error(f"PRODUCER FAILED: Max retries ({max_retries}) reached for file {file_id_int} with final client {client_name}.")
 
-    # FINAL: Queue ko hamesha band karo (LocalProtocolError se bachne ke liye)
+    # FINAL: Queue ko hamesha band karo
     await queue.put(None)
 
 
@@ -315,6 +338,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
     producer_task = asyncio.create_task(
+        # file_id_int pass kiya gaya hai
         download_producer(client_instance_for_download, file_entity_for_download, file_id_int, start, end, OPTIMAL_CHUNK_SIZE, queue)
     )
     
@@ -431,7 +455,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
                             file_title = attr.file_name
                             break
                 
-                # 🌟 Cache the fetched data (entity ke saath file_reference bhi cache ho jayega)
+                  # 🌟 Cache the fetched data (entity ke saath file_reference bhi cache ho jayega)
                 FILE_METADATA_CACHE[file_id_int] = {
                     'size': file_size,
                     'title': file_title,
@@ -458,7 +482,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-      # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
+    # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
     if range_header:
         # Partial Content (206) response
         try:
@@ -478,6 +502,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             "Connection": "keep-alive"
         }
         return StreamingResponse(
+            # file_id_int pass kiya gaya hai
             file_iterator(download_client, file_entity_for_download, file_id_int, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
             headers=headers
@@ -493,6 +518,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         
         return StreamingResponse(
+            # file_id_int pass kiya gaya hai
             file_iterator(download_client, file_entity_for_download, file_id_int, file_size, None, request),
             headers=headers
         )
