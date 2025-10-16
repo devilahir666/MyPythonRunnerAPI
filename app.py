@@ -134,7 +134,6 @@ async def startup_event():
     for token in BOT_TOKENS:
         try:
             # Bot token se connect karna
-            # Bot client ko USER_SESSION_CONFIG ki API ID/Hash use karni hogi
             bot_client = await TelegramClient(None, 
                                               api_id=USER_SESSION_CONFIG['api_id'], 
                                               api_hash=USER_SESSION_CONFIG['api_hash']).start(bot_token=token)
@@ -197,16 +196,18 @@ async def root():
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
+# 🚨 Signature Change: file_id_int add kiya gaya hai 🚨
 async def download_producer(
-    client_instance: TelegramClient, # Ab yeh Bot Client hoga
+    client_instance: TelegramClient, 
     file_entity, 
+    file_id_int: int, # Message ID integer
     start_offset: int, 
     end_offset: int, 
     chunk_size: int, 
     queue: asyncio.Queue
 ):
     """Background mein Telegram se data download karke queue mein daalta hai (Producer)।"""
-    global owner_client # Owner client ko access karne ke liye
+    global owner_client 
 
     offset = start_offset
     max_retries = 3
@@ -246,10 +247,10 @@ async def download_producer(
 
             # --- File Reference Refresh Logic ---
             try:
-                # Channel entity ko dobara resolve karne ki zaroorat nahi, sirf message fetch karo
+                # ✅ FIX: file_entity.id (bada number) ki jagah URL se aaye file_id_int (sahi number) ka use
                 refreshed_message = await owner_client.get_messages(
                     TEST_CHANNEL_ENTITY_USERNAME, 
-                    ids=file_entity.id # Message ID se dobara fetch
+                    ids=file_id_int 
                 ) 
                 
                 new_file_entity = None
@@ -264,20 +265,20 @@ async def download_producer(
                     
                     # File entity aur Cache ko update karo
                     file_entity = new_file_entity 
-                    FILE_METADATA_CACHE[file_entity.id]['entity'] = new_file_entity
-                    FILE_METADATA_CACHE[file_entity.id]['timestamp'] = time.time() # Cache TTL refresh karo
+                    FILE_METADATA_CACHE[file_id_int]['entity'] = new_file_entity
+                    FILE_METADATA_CACHE[file_id_int]['timestamp'] = time.time() 
                     
-                    logging.info(f"PRODUCER: Reference refreshed successfully for {file_entity.id}. Resuming download from offset {offset}.")
-                    # Ab loop dobara chlega naye reference ke saath
+                    logging.info(f"PRODUCER: Reference refreshed successfully for {file_id_int}. Resuming download from offset {offset}.")
                     continue # Retry ke baad while loop dobara chalega
                 else:
                     logging.error("PRODUCER FATAL: Failed to get new media entity during refresh.")
-                    break # Stop trying if refresh fails to provide a new entity
+                    break 
 
             except Exception as ref_e:
-                logging.error(f"PRODUCER ERROR ({client_name}): Failed to refresh reference: {type(ref_e).__name__}. Retrying...")
-                await asyncio.sleep(2) # Thoda wait karo aur dobara try karo (agar max_retries baki ho)
-                continue # Retry
+                # Catch struct.error here
+                logging.error(f"PRODUCER ERROR ({client_name}): Failed to refresh reference: {type(ref_e).__name__}: {ref_e}. Retrying...")
+                await asyncio.sleep(2) 
+                continue 
         
         except (RPCError, TimeoutError, AuthKeyError) as e:
             logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download.")
@@ -287,12 +288,14 @@ async def download_producer(
             break
     
     if retries >= max_retries:
-        logging.error(f"PRODUCER FAILED: Max retries ({max_retries}) reached for file {file_entity.id}.")
+        logging.error(f"PRODUCER FAILED: Max retries ({max_retries}) reached for file {file_id_int}.")
 
+    # FINAL: Queue ko hamesha band karo (LocalProtocolError se bachne ke liye)
     await queue.put(None)
 
 
-async def file_iterator(client_instance_for_download, file_entity_for_download, file_size, range_header, request: Request):
+# 🚨 Signature Change: file_id_int add kiya gaya hai 🚨
+async def file_iterator(client_instance_for_download, file_entity_for_download, file_id_int, file_size, range_header, request: Request):
     """Queue se chunks nikalta hai aur FastAPI ko stream karta hai (Consumer)।"""
     start = 0
     end = file_size - 1
@@ -312,7 +315,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
     producer_task = asyncio.create_task(
-        download_producer(client_instance_for_download, file_entity_for_download, start, end, OPTIMAL_CHUNK_SIZE, queue)
+        download_producer(client_instance_for_download, file_entity_for_download, file_id_int, start, end, OPTIMAL_CHUNK_SIZE, queue)
     )
     
     try:
@@ -342,7 +345,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# FINAL FIX: stream_file_by_message_id (NameError fixed)
+# FINAL FIX: stream_file_by_message_id (Producer aur Iterator call update)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -355,7 +358,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         raise HTTPException(status_code=503, detail="Telegram Clients are not connected or pool is empty.")
 
     metadata_client = owner_client
-    download_client = get_next_bot_client() # Round-Robin se Bot chunna
+    download_client = get_next_bot_client() 
     
     if download_client is None:
         raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
@@ -380,7 +383,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
     # --- 3. Message ID Check ---
     try:
-        file_id_int = int(message_id)
+        file_id_int = int(message_id) # Original message ID
     except ValueError:
         raise HTTPException(status_code=400, detail="Message ID must be a valid integer.")
 
@@ -455,7 +458,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-     # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
+      # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
     if range_header:
         # Partial Content (206) response
         try:
@@ -475,14 +478,12 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             "Connection": "keep-alive"
         }
         return StreamingResponse(
-            file_iterator(download_client, file_entity_for_download, file_size, range_header, request), 
+            file_iterator(download_client, file_entity_for_download, file_id_int, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
             headers=headers
         )
     else:
         # Full content request (200) response
-        
-        # ✅ FIX: headers define kiya gaya hai
         headers = { 
             "Content-Type": content_type,
             "Content-Length": str(file_size),
@@ -492,6 +493,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         
         return StreamingResponse(
-            file_iterator(download_client, file_entity_for_download, file_size, None, request),
+            file_iterator(download_client, file_entity_for_download, file_id_int, file_size, None, request),
             headers=headers
         )
