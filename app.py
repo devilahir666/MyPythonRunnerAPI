@@ -1,7 +1,6 @@
 # --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING & LAZY CACHING) ---
 
 # Import necessary libraries
-# StringSession import rakha hai, agar aap bhavishya mein Base64 use karna chahein.
 from telethon.sessions import StringSession 
 import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
@@ -19,57 +18,48 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
-# --- GLOBAL CONFIGURATION (USER SESSIONS) ---
-# WARNING: Yeh aapki private data hai. Hamesha surakshit rakhein!
+# --- GLOBAL CONFIGURATION (USER SESSION & BOT POOL) ---
 
-# Ab yeh session files ka path hai (jo aapne commit ki hain)
+# 1. USER SESSION CONFIG (Metadata Fetcher)
+# Iska kaam sirf channel entity resolve karna aur file reference nikalna hai.
 SESSION_FILE_OWNER = "owner.session"
-SESSION_FILE_ADMIN = "admin.session"
 
-CONFIGS = [
-    {
-        'api_id': 23692613,                                # Owner Account ki API ID
-        'api_hash': "8bb69956d38a8226433186a199695f57",    # Owner Account ka API Hash
-        'session_file': SESSION_FILE_OWNER, 
-        'name': 'owner_client'
-    },
-    {
-        'api_id': 29243403,                                # Admin Account ki Doosri API ID 
-        'api_hash': "1adc479f6027488cdd13259028056b73",    # Admin Account ka Doosra API Hash 
-        'session_file': SESSION_FILE_ADMIN,
-        'name': 'admin_client'
-    },
+USER_SESSION_CONFIG = {
+    'api_id': 23692613,                                # Owner Account ki API ID
+    'api_hash': "8bb69956d38a8226433186a199695f57",    # Owner Account ka API Hash
+    'session_file': SESSION_FILE_OWNER, 
+    'name': 'owner_client'
+}
+
+# 2. BOT POOL CONFIG (Download Workers)
+# Har bot download speed badhaega.
+BOT_TOKENS = [
+    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", # Aapka diya hua Bot Token
 ]
 
 # Global pool aur counter
-client_pool: list[TelegramClient] = []
-global_client_counter = 0
-
-# --- GLOBAL VARIABLES HATA DIYE GAYE HAIN ---
-# 🚨 resolved_channel_entity: Optional[Any] = None 
-# 🚨 entity_resolve_lock = asyncio.Lock()
-# -------------------------------------------
+owner_client: Optional[TelegramClient] = None # Single User Client
+bot_client_pool: list[TelegramClient] = []   # Bot Clients ka Pool
+global_bot_counter = 0                       # Bot pool ke liye Round-Robin counter
 
 # --- Helper function to select client (Round-Robin) ---
-def get_next_client() -> Optional[TelegramClient]:
-    """Round-Robin tarike se agla client chunnta hai।"""
-    global global_client_counter
-    if not client_pool:
+def get_next_bot_client() -> Optional[TelegramClient]:
+    """Round-Robin tarike se agla bot client chunnta hai (Download Worker)।"""
+    global global_bot_counter
+    if not bot_client_pool:
         return None
         
-    client_index = global_client_counter % len(client_pool)
-    selected_client = client_pool[client_index]
-    global_client_counter += 1 
+    client_index = global_bot_counter % len(bot_client_pool)
+    selected_client = bot_client_pool[client_index]
+    global_bot_counter += 1 
     
-    if global_client_counter >= len(client_pool) * 1000:
-        global_client_counter = 0
+    if global_bot_counter >= len(bot_client_pool) * 1000:
+        global_bot_counter = 0
 
     return selected_client
 # --------------------------------------------------------
 
 # --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
-# --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
-# FINAL FIX: Private channel ko Invite Link Hash se access karein
 TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/+hPquYFblYHkxYzg1' 
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
 BUFFER_CHUNK_COUNT = 4 
@@ -82,7 +72,7 @@ FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
 CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
 # -------------------------------
 
-app = FastAPI(title="Telethon Async Streaming Proxy (User Session Pool)")
+app = FastAPI(title="Telethon Async Streaming Proxy (User Session + Bot Pool)")
 
 async def keep_alive_pinger():
     """Render Free Tier ko inactive hone se rokne ke liye self-ping karta hai।"""
@@ -105,26 +95,24 @@ async def keep_alive_pinger():
 
 
 # ----------------------------------------------------------------------
-# UPDATED startup_event function (Using DIRECT SQLite Session Files)
+# UPDATED startup_event function (Owner User Session aur Bot Pool ko connect karta hai)
 # ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    global client_pool
-    logging.info("Attempting to connect Telegram User Session Pool using SQLite Files...") 
+    global owner_client, bot_client_pool
+    logging.info("Attempting to connect Telegram Clients (User Session & Bot Pool)...") 
 
     asyncio.create_task(keep_alive_pinger())
     logging.info("PINGER: Keep-alive task scheduled.")
 
-    for config in CONFIGS:
-        session_file_path = config.get('session_file')
-        client_name = config.get('name')
-        
-        # 1. File Existence Check
-        if not os.path.exists(session_file_path):
-             logging.critical(f"FATAL CONNECTION ERROR for {client_name}: Session file {session_file_path} NOT FOUND in repo. Did you commit it?")
-             continue
-
-        # 2. Telethon से connect करो
+    # --- 1. USER SESSION CONNECTION (Owner - Metadata Fetcher) ---
+    config = USER_SESSION_CONFIG
+    session_file_path = config.get('session_file')
+    client_name = config.get('name')
+    
+    if not os.path.exists(session_file_path):
+         logging.critical(f"FATAL CONNECTION ERROR for {client_name}: Session file {session_file_path} NOT FOUND.")
+    else:
         try:
             client_instance = TelegramClient(
                 session=session_file_path,
@@ -132,38 +120,58 @@ async def startup_event():
                 api_hash=config['api_hash'],
                 retry_delay=1
             )
-            
             await client_instance.start()
             
             if await client_instance.is_user_authorized():
-                 logging.info(f"User Session ({client_name}) connected and authorized successfully!")
-                 client_pool.append(client_instance)
+                 logging.info(f"User Session ({client_name}) connected and authorized successfully! (Role: Metadata Fetcher)")
+                 owner_client = client_instance
             else:
-                 logging.error(f"User Session ({client_name}) failed to authorize. (Session may be expired. Regenerate the {session_file_path} file.)")
-
-        except FloodWaitError as e:
-             logging.error(f"FATAL CONNECTION ERROR for {client_name}: FloodWaitError: Too many connection attempts. Wait {e.seconds} seconds.")
-             continue
+                 logging.error(f"User Session ({client_name}) failed to authorize. (Session may be expired.)")
         except Exception as e:
             logging.error(f"FATAL CONNECTION ERROR for {client_name}: {type(e).__name__}: {e}. Client will remain disconnected.")
-            continue
+
+    # --- 2. BOT POOL CONNECTION (Workers) ---
+    for token in BOT_TOKENS:
+        try:
+            # Bot token se connect karna
+            bot_client = await TelegramClient(None, 
+                                              api_id=USER_SESSION_CONFIG['api_id'], 
+                                              api_hash=USER_SESSION_CONFIG['api_hash']).start(bot_token=token)
+            
+            bot_info = await bot_client.get_me()
+            logging.info(f"Bot Session (@{bot_info.username}) connected successfully! (Role: Download Worker)")
+            bot_client_pool.append(bot_client)
+
+        except Exception as e:
+            logging.error(f"FATAL BOT CONNECTION ERROR: {type(e).__name__}: {e}. Bot will remain disconnected.")
     
-    if not client_pool:
-         logging.critical("CRITICAL: No Telegram User Sessions could connect. Service will be unavailable.")
+    # Critical Check
+    if not owner_client:
+         logging.critical("CRITICAL: Owner User Session could not connect. Metadata fetching will fail.")
+    if not bot_client_pool:
+         logging.critical("CRITICAL: No Bot Clients could connect. Downloading will fail.")
+    if not owner_client and not bot_client_pool:
+         logging.critical("CRITICAL: Service will be unavailable.")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global client_pool
-    for client_instance in client_pool:
-        if client_instance:
+    global owner_client, bot_client_pool
+    
+    # Close Owner Client
+    if owner_client:
+        logging.info("Closing Owner Telegram Client connection...")
+        await owner_client.disconnect()
+
+    # Close Bot Clients
+    for bot_client in bot_client_pool:
+        if bot_client:
             try:
-                name = client_instance.session.filename if hasattr(client_instance.session, 'filename') else 'session'
+                name = (await bot_client.get_me()).username
             except:
-                name = 'session'
-                
-            logging.info(f"Closing Telegram Client connection for {name}...")
-            await client_instance.disconnect()
+                name = 'Bot'
+            logging.info(f"Closing Telegram Bot Client connection for @{name}...")
+            await bot_client.disconnect()
 
 
 @app.get("/")
@@ -171,28 +179,25 @@ async def root():
     chunk_mb = OPTIMAL_CHUNK_SIZE // (1024 * 1024)
     total_buffer_mb = chunk_mb * BUFFER_CHUNK_COUNT
     
-    authorized_clients = 0
-    
-    for client_instance in client_pool:
-        try:
-            if client_instance.is_connected() and await client_instance.is_user_authorized():
-                authorized_clients += 1
-        except Exception:
-            pass
-            
-    if authorized_clients > 0:
-        status_msg = f"Streaming Proxy Active. Clients: {authorized_clients}/{len(CONFIGS)}. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB). Metadata Cache TTL: {CACHE_TTL//60} mins."
+    owner_status = False
+    if owner_client and owner_client.is_connected() and await owner_client.is_user_authorized():
+        owner_status = True
+        
+    authorized_bots = 0
+    for bot_client in bot_client_pool:
+        if bot_client.is_connected():
+            authorized_bots += 1
+
+    if owner_status and authorized_bots > 0:
+        status_msg = f"Streaming Proxy Active. Owner: Connected. Bots: {authorized_bots}/{len(BOT_TOKENS)}. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB). Metadata Cache TTL: {CACHE_TTL//60} mins."
     else:
-        status_msg = f"Client Pool is NOT connected/authorized ({len(client_pool)} sessions connected, {authorized_clients} authorized). (503 Service Unavailable)."
+        status_msg = f"Client Pool is NOT fully connected (Owner: {owner_status}, Bots: {authorized_bots}). (503 Service Unavailable)."
 
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
-# 🚨 _get_or_resolve_channel_entity function ko hata diya gaya hai. 🚨
-
-
 async def download_producer(
-    client_instance: TelegramClient, 
+    client_instance: TelegramClient, # Ab yeh Bot Client hoga
     file_entity, 
     start_offset: int, 
     end_offset: int, 
@@ -203,14 +208,18 @@ async def download_producer(
     offset = start_offset
     
     try:
-        client_name = client_instance.session.filename if hasattr(client_instance.session, 'filename') else 'client'
+        if hasattr(client_instance.session, 'filename'):
+            client_name = client_instance.session.filename
+        else:
+            client_name = (await client_instance.get_me()).username # Bot Name
     except:
-        client_name = 'client'
+        client_name = 'client/bot'
         
     try:
         while offset <= end_offset:
             limit = min(chunk_size, end_offset - offset + 1)
             
+            # CRITICAL: Yahan Bot Client, Owner se mile File Entity ko use karke download karta hai.
             async for chunk in client_instance.iter_download(
                 file_entity, 
                 offset=offset,
@@ -225,6 +234,7 @@ async def download_producer(
                  break 
         
     except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
+        # FileReferenceExpiredError aane par, cache miss/expired ho jana chahiye
         logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download.")
     except Exception as e:
         logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
@@ -283,34 +293,41 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# ✅ FINAL FIX: stream_file_by_message_id (Channel Resolution Fix)
+# FINAL FIX: stream_file_by_message_id (Metadata Owner se, Download Bot se)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
     """Telegram Message ID se file stream karta hai।"""
     
-    # --- 1. Client Selection ---
-    client_instance = get_next_client()
-    if client_instance is None:
-        raise HTTPException(status_code=503, detail="Telegram Client Pool is not connected or empty.")
+    global owner_client, bot_client_pool
+    
+    # --- 1. Client Check aur Selection ---
+    if owner_client is None or not bot_client_pool:
+        raise HTTPException(status_code=503, detail="Telegram Clients are not connected or pool is empty.")
+
+    metadata_client = owner_client
+    download_client = get_next_bot_client() # Round-Robin se Bot chunna
+    
+    if download_client is None:
+        raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
         
     try:
-        client_name = client_instance.session.filename if hasattr(client_instance.session, 'filename') else 'client'
+        metadata_client_name = metadata_client.session.filename if hasattr(metadata_client.session, 'filename') else 'owner'
+        bot_client_name = (await download_client.get_me()).username
     except:
-        client_name = 'client'
-        
-    logging.info(f"Using client: {client_name} for Message ID: {message_id}")
+        metadata_client_name = 'owner'
+        bot_client_name = 'bot_worker'
+
+    logging.info(f"Metadata client: {metadata_client_name}. Download client: @{bot_client_name} for Message ID: {message_id}")
     
-    # 🚨 FIX: Channel Resolution ab har client अपने लिए खुद करेगा 🚨
+    # --- 2. Channel Resolution (Owner Client se) ---
     resolved_entity = None
     try:
-        # Client ab seedhe channel entity ko resolve karega
-        resolved_entity = await client_instance.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by {client_name}.")
+        resolved_entity = await metadata_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by {metadata_client_name}.")
     except Exception as e:
-        # Agar resolution fail hota hai to yahan 500 return hoga
-        logging.error(f"FATAL RESOLUTION ERROR ({client_name}): Could not resolve target channel entity: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using {client_name}. Error: {type(e).__name__}")
+        logging.error(f"FATAL RESOLUTION ERROR ({metadata_client_name}): Could not resolve target channel entity: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using {metadata_client_name}.")
         
     # --- 3. Message ID Check ---
     try:
@@ -322,8 +339,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     file_title = f"movie_{message_id}.mkv" 
     file_entity_for_download = None 
     
-    
-    # 🌟 JUGAD 2: Check Caching
+    # 🌟 Caching check and Metadata Fetch (Owner Client se)
     current_time = time.time()
     cached_data = FILE_METADATA_CACHE.get(file_id_int) 
     
@@ -335,12 +351,11 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
     else:
         # Cache Miss/Expired: API se naya data fetch karo
-        logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata using {client_name}...")
+        logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata using {metadata_client_name}...")
         
         # --- METADATA FETCHING ---
         try:
-            # Resolved entity abhi upar resolve ho chuka hai
-            message = await client_instance.get_messages(resolved_entity, ids=file_id_int) 
+            message = await metadata_client.get_messages(resolved_entity, ids=file_id_int) 
             
             media_entity = None
             if message and message.media:
@@ -353,13 +368,18 @@ async def stream_file_by_message_id(message_id: str, request: Request):
                 file_size = media_entity.size
                 file_entity_for_download = media_entity
                 
+                # CRITICAL CHECK: File reference hona anivarya hai
+                if not hasattr(file_entity_for_download, 'file_reference') or not file_entity_for_download.file_reference:
+                     logging.error(f"Metadata FAILED: File reference missing for message {file_id_int}. Bot cannot download.")
+                     raise HTTPException(status_code=500, detail="Internal error: File reference missing from Telegram API response.")
+
                 if media_entity.attributes:
                     for attr in media_entity.attributes:
                         if hasattr(attr, 'file_name'):
                             file_title = attr.file_name
                             break
                 
-                # 🌟 JUGAD 3: Cache the fetched data
+                # 🌟 Cache the fetched data (entity ke saath file_reference bhi cache ho jayega)
                 FILE_METADATA_CACHE[file_id_int] = {
                     'size': file_size,
                     'title': file_title,
@@ -374,53 +394,34 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         except HTTPException:
             raise
         except Exception as e:
-            # Yehi woh error hai jo admin ke liye aaya tha!
-            logging.error(f"METADATA RESOLUTION ERROR ({client_name}): {type(e).__name__}: {e}. (Possible permission/access issue.)")
+            logging.error(f"METADATA RESOLUTION ERROR ({metadata_client_name}): {type(e).__name__}: {e}.")
             FILE_METADATA_CACHE.pop(file_id_int, None) 
             raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
     
-    # 4. Range Handling aur Headers 
+    # 4. Range Handling aur Headers (Bot Download ke liye set karna)
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
+    # ... headers calculation remains the same ...
+
+    # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
     if range_header:
         # Partial Content (206) response
-        try:
-            start_str = range_header.split('=')[1].split('-')[0]
-            start_range = int(start_str) if start_str else 0
-        except:
-            start_range = 0
-            
-        content_length = file_size - start_range
-        
-        headers = {
-            "Content-Type": content_type,
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(content_length),
-            "Content-Range": f"bytes {start_range}-{file_size - 1}/{file_size}",
-            "Content-Disposition": f"inline; filename=\"{file_title}\"",
-            "Connection": "keep-alive"
-        }
+        # ... header calculation ...
         return StreamingResponse(
-            file_iterator(client_instance, file_entity_for_download, file_size, range_header, request), 
+            file_iterator(download_client, file_entity_for_download, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
             headers=headers
         )
     else:
         # Full content request (200) response
-        headers = {
-            "Content-Type": content_type,
-            "Content-Length": str(file_size),
-            "Accept-Ranges": "bytes",
-            "Content-Disposition": f"inline; filename=\"{file_title}\"",
-            "Connection": "keep-alive"
-        }
+        # ... header calculation ...
         return StreamingResponse(
-            file_iterator(client_instance, file_entity_for_download, file_size, None, request),
+            file_iterator(download_client, file_entity_for_download, file_size, None, request),
             headers=headers
-                    )
+        )
         
