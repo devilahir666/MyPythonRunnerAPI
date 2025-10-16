@@ -68,7 +68,9 @@ def get_next_client() -> Optional[TelegramClient]:
 # --------------------------------------------------------
 
 # --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
-TEST_CHANNEL_ENTITY_USERNAME = '@serverdata00'
+# --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
+# FINAL FIX: Private channel ko Invite Link Hash se access karein
+TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/+hPquYFblYHkxYzg1' 
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
 BUFFER_CHUNK_COUNT = 4 
 
