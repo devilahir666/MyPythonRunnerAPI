@@ -1,8 +1,7 @@
 # --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING & LAZY CACHING) ---
 
 # Import necessary libraries
-# 🚨 IMPORTANT FIX: Ab hum session file path ko seedha use kar rahe hain.
-# StringSession ki jagah session file path use hoga.
+# StringSession import rakha hai, agar aap bhavishya mein Base64 use karna chahein.
 from telethon.sessions import StringSession 
 import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
@@ -12,11 +11,8 @@ from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, F
 import logging
 import time
 from typing import Dict, Any, Optional
-# --- Self-ping ke liye httpx ---
 import httpx 
-# --- User Session aur File check ke liye imports ---
 import os 
-# 🚨 're' module ko ab hata diya gaya hai, kyunki string cleaning ki zarurat nahi hai.
 # ------------------------------------------
 
 # Set up logging 
@@ -24,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
 # --- GLOBAL CONFIGURATION (USER SESSIONS) ---
-# 🚨 WARNING: Yeh aapki private data hai. Hamesha surakshit rakhein!
+# WARNING: Yeh aapki private data hai. Hamesha surakshit rakhein!
 
 # Ab yeh session files ka path hai (jo aapne commit ki hain)
 SESSION_FILE_OWNER = "owner.session"
@@ -48,6 +44,11 @@ CONFIGS = [
 # Global pool aur counter
 client_pool: list[TelegramClient] = []
 global_client_counter = 0
+
+# --- GLOBAL VARIABLES HATA DIYE GAYE HAIN ---
+# 🚨 resolved_channel_entity: Optional[Any] = None 
+# 🚨 entity_resolve_lock = asyncio.Lock()
+# -------------------------------------------
 
 # --- Helper function to select client (Round-Robin) ---
 def get_next_client() -> Optional[TelegramClient]:
@@ -73,16 +74,13 @@ BUFFER_CHUNK_COUNT = 4
 
 # ** PINGER CONFIGURATION **
 PINGER_DELAY_SECONDS = 120
-PUBLIC_SELF_PING_URL = "https://telegram-stream-proxy-x63x.onrender.com/" # 🚨 Is URL ko update karna na bhoolein
-# 🌟 JUGAD 1: Metadata Caching Setup
+PUBLIC_SELF_PING_URL = "https://telegram-stream-proxy-x63x.onrender.com/"
+# Metadata Caching Setup
 FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
 CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
 # -------------------------------
 
 app = FastAPI(title="Telethon Async Streaming Proxy (User Session Pool)")
-resolved_channel_entity: Optional[Any] = None 
-entity_resolve_lock = asyncio.Lock()
-
 
 async def keep_alive_pinger():
     """Render Free Tier ko inactive hone se rokne ke liye self-ping karta hai।"""
@@ -105,52 +103,46 @@ async def keep_alive_pinger():
 
 
 # ----------------------------------------------------------------------
-# ✅ FINAL FIX: UPDATED startup_event function (Using DIRECT SQLite Session Files)
+# UPDATED startup_event function (Using DIRECT SQLite Session Files)
 # ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
     global client_pool
-    # Log update kiya
     logging.info("Attempting to connect Telegram User Session Pool using SQLite Files...") 
 
     asyncio.create_task(keep_alive_pinger())
     logging.info("PINGER: Keep-alive task scheduled.")
 
     for config in CONFIGS:
-        session_file_path = config.get('session_file') # Ab ye 'owner.session' jaisa file name hai
+        session_file_path = config.get('session_file')
         client_name = config.get('name')
         
         # 1. File Existence Check
         if not os.path.exists(session_file_path):
-             # Agar file repo mein nahi mili, toh critical error
              logging.critical(f"FATAL CONNECTION ERROR for {client_name}: Session file {session_file_path} NOT FOUND in repo. Did you commit it?")
              continue
 
         # 2. Telethon से connect करो
         try:
-            # FIX: Seedhe session file ka path use karein. Telethon khud is file ko Session database manega.
             client_instance = TelegramClient(
-                session=session_file_path, # Seedha file ka naam pass kiya
+                session=session_file_path,
                 api_id=config['api_id'], 
                 api_hash=config['api_hash'],
                 retry_delay=1
             )
             
-            # User Session start
             await client_instance.start()
             
             if await client_instance.is_user_authorized():
                  logging.info(f"User Session ({client_name}) connected and authorized successfully!")
                  client_pool.append(client_instance)
             else:
-                 # Ye tab hota hai jab file exist karti hai lekin user log out ho gaya ho.
                  logging.error(f"User Session ({client_name}) failed to authorize. (Session may be expired. Regenerate the {session_file_path} file.)")
 
         except FloodWaitError as e:
              logging.error(f"FATAL CONNECTION ERROR for {client_name}: FloodWaitError: Too many connection attempts. Wait {e.seconds} seconds.")
              continue
         except Exception as e:
-            # Agar file corrupt ho ya koi aur error ho
             logging.error(f"FATAL CONNECTION ERROR for {client_name}: {type(e).__name__}: {e}. Client will remain disconnected.")
             continue
     
@@ -164,7 +156,6 @@ async def shutdown_event():
     for client_instance in client_pool:
         if client_instance:
             try:
-                # File-based session mein get_update_info nahi hota, isliye default name use karenge
                 name = client_instance.session.filename if hasattr(client_instance.session, 'filename') else 'session'
             except:
                 name = 'session'
@@ -180,10 +171,8 @@ async def root():
     
     authorized_clients = 0
     
-    # Check current status of the pool
     for client_instance in client_pool:
         try:
-            # Check user authorization status
             if client_instance.is_connected() and await client_instance.is_user_authorized():
                 authorized_clients += 1
         except Exception:
@@ -197,33 +186,7 @@ async def root():
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
-async def _get_or_resolve_channel_entity(client_instance: TelegramClient):
-    """Channel entity ko resolve karta hai aur global variable mein cache karta hai (Lazy Caching)।"""
-    global resolved_channel_entity
-    
-    # 1. Global cache hit check (All clients share the same resolved entity)
-    if resolved_channel_entity:
-        return resolved_channel_entity
-
-    # 2. Lazy Resolve
-    async with entity_resolve_lock:
-        # Double check after acquiring lock
-        if resolved_channel_entity:
-            return resolved_channel_entity
-            
-        try:
-            client_name = client_instance.session.filename if hasattr(client_instance.session, 'filename') else 'client'
-        except:
-            client_name = 'client'
-            
-        logging.info(f"LAZY RESOLVE: Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME} using {client_name}...")
-        try:
-            resolved_channel_entity = await client_instance.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-            logging.info(f"LAZY RESOLVE SUCCESS: Channel resolved and cached.")
-            return resolved_channel_entity
-        except Exception as e:
-            logging.error(f"LAZY RESOLVE FAILED: Could not resolve target channel entity: {e}")
-            raise HTTPException(status_code=500, detail="Could not resolve target channel entity.")
+# 🚨 _get_or_resolve_channel_entity function ko hata diya gaya hai. 🚨
 
 
 async def download_producer(
@@ -246,14 +209,12 @@ async def download_producer(
         while offset <= end_offset:
             limit = min(chunk_size, end_offset - offset + 1)
             
-            # Telethon se download ki request
             async for chunk in client_instance.iter_download(
                 file_entity, 
                 offset=offset,
                 limit=limit,
                 chunk_size=chunk_size
             ):
-                # Chunk ko queue mein daalo
                 await queue.put(chunk)
                 offset += len(chunk)
 
@@ -267,7 +228,6 @@ async def download_producer(
         logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
     
     finally:
-        # Download poora hone par Sentinel (None) daal do
         await queue.put(None)
 
 
@@ -320,6 +280,9 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
         await asyncio.gather(producer_task, return_exceptions=True)
 
 
+# ----------------------------------------------------------------------
+# ✅ FINAL FIX: stream_file_by_message_id (Channel Resolution Fix)
+# ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
     """Telegram Message ID se file stream karta hai।"""
@@ -336,9 +299,18 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
     logging.info(f"Using client: {client_name} for Message ID: {message_id}")
     
-    # --- 2. Channel Resolution ---
-    resolved_entity = await _get_or_resolve_channel_entity(client_instance) 
+    # 🚨 FIX: Channel Resolution ab har client अपने लिए खुद करेगा 🚨
+    resolved_entity = None
+    try:
+        # Client ab seedhe channel entity ko resolve karega
+        resolved_entity = await client_instance.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by {client_name}.")
+    except Exception as e:
+        # Agar resolution fail hota hai to yahan 500 return hoga
+        logging.error(f"FATAL RESOLUTION ERROR ({client_name}): Could not resolve target channel entity: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using {client_name}. Error: {type(e).__name__}")
         
+    # --- 3. Message ID Check ---
     try:
         file_id_int = int(message_id)
     except ValueError:
@@ -351,7 +323,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     
     # 🌟 JUGAD 2: Check Caching
     current_time = time.time()
-    cached_data = FILE_METADATA_CACHE.get(file_id_int)
+    cached_data = FILE_METADATA_CACHE.get(file_id_int) 
     
     if cached_data and (current_time - cached_data['timestamp']) < CACHE_TTL:
         logging.info(f"Cache HIT for message {file_id_int}. Skipping Telegram API call.")
@@ -365,6 +337,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
         # --- METADATA FETCHING ---
         try:
+            # Resolved entity abhi upar resolve ho chuka hai
             message = await client_instance.get_messages(resolved_entity, ids=file_id_int) 
             
             media_entity = None
@@ -399,12 +372,13 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         except HTTPException:
             raise
         except Exception as e:
-            logging.error(f"METADATA RESOLUTION ERROR ({client_name}): {type(e).__name__}: {e}")
+            # Yehi woh error hai jo admin ke liye aaya tha!
+            logging.error(f"METADATA RESOLUTION ERROR ({client_name}): {type(e).__name__}: {e}. (Possible permission/access issue.)")
             FILE_METADATA_CACHE.pop(file_id_int, None) 
             raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
     
-    # 3. Range Handling aur Headers 
+    # 4. Range Handling aur Headers 
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
@@ -446,5 +420,5 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         return StreamingResponse(
             file_iterator(client_instance, file_entity_for_download, file_size, None, request),
             headers=headers
-            )
-                
+                    )
+        
