@@ -191,7 +191,7 @@ async def root():
     if owner_status and authorized_bots > 0:
         status_msg = f"Streaming Proxy Active. Owner: Connected. Bots: {authorized_bots}/{len(BOT_TOKENS)}. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB). Metadata Cache TTL: {CACHE_TTL//60} mins."
     else:
-        status_msg = f"Client Pool is NOT fully connected (Owner: {owner_status}, Bots: {authorized_bots}). (503 Service Unavailable)."
+        status_msg = f"Streaming Proxy Active. Owner: {owner_status}. Bots: {authorized_bots}/{len(BOT_TOKENS)}. (503 Service Unavailable)."
 
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
@@ -293,7 +293,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# FINAL FIX: stream_file_by_message_id (Metadata Owner se, Download Bot se)
+# FINAL FIX: stream_file_by_message_id (Metadata Owner se, Download Bot se, NameError fixed)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -399,19 +399,32 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
     
-    # 4. Range Handling aur Headers (Bot Download ke liye set karna)
+    # 4. Range Handling aur Headers 
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-    # ... headers calculation remains the same ...
-
     # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
     if range_header:
         # Partial Content (206) response
-        # ... header calculation ...
+        try:
+            start_str = range_header.split('=')[1].split('-')[0]
+            start_range = int(start_str) if start_str else 0
+        except:
+            start_range = 0
+            
+        content_length = file_size - start_range
+        
+        headers = { # <--- Headers defined for 206
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Content-Range": f"bytes {start_range}-{file_size - 1}/{file_size}",
+            "Content-Disposition": f"inline; filename=\"{file_title}\"",
+            "Connection": "keep-alive"
+        }
         return StreamingResponse(
             file_iterator(download_client, file_entity_for_download, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
@@ -419,7 +432,16 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         )
     else:
         # Full content request (200) response
-        # ... header calculation ...
+        
+        # ✅ FIX: Yahan 'headers' ko define kiya gaya hai
+        headers = { # <--- Headers defined for 200 (Fix)
+            "Content-Type": content_type,
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f"inline; filename=\"{file_title}\"",
+            "Connection": "keep-alive"
+        }
+        
         return StreamingResponse(
             file_iterator(download_client, file_entity_for_download, file_size, None, request),
             headers=headers
