@@ -15,7 +15,6 @@ from typing import Dict, Any, Optional
 import httpx 
 # --- Naye User Session ke liye imports ---
 import os 
-import base64
 # ------------------------------------------
 
 # Set up logging 
@@ -1056,7 +1055,6 @@ PINGER_DELAY_SECONDS = 120 # 2 minutes (Render Free Tier ke liye optimal)
 
 # 🚨 RENDER SELF-PING URL (Aapka Public URL) 🚨
 PUBLIC_SELF_PING_URL = "https://telegram-stream-proxy-x63x.onrender.com/"
-
 # 🌟 JUGAD 1: Metadata Caching Setup
 FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
 CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
@@ -1093,6 +1091,7 @@ async def keep_alive_pinger():
 
 # ----------------------------------------------------------------------
 # UPDATED startup_event function (Ab User Sessions connect karega)
+# --- FIX FOR: TypeError: The given session must be a str or a Session instance. ---
 # ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -1103,34 +1102,34 @@ async def startup_event():
     logging.info("PINGER: Keep-alive task scheduled.")
 
     for config in CONFIGS:
+        # Pata karo ki string placeholder toh nahi hai (safety check)
         if config['session_b64'] in ["Apni_OWNER_ki_puri_Base64_String_yahan_daalein==", "Apni_ADMIN_ki_puri_Base64_String_yahan_daalein=="]:
             logging.warning(f"SKIPPING: Session string for {config['name']} is a placeholder. Please update the CONFIGS.")
             continue
             
         try:
-            # Base64 string ko binary session data mein decode karna
-            session_data_bytes = base64.b64decode(config['session_b64'])
+            # ✅ FIX: Ab hum Base64 string ko StringSession object mein badlenge
+            session_obj = StringSession(config['session_b64'])
             
-            # Client object banao: session=bytes data, aur koi bot_token nahi
+            # Client object banao: session=ab StringSession object pass karo
             client_instance = TelegramClient(
-                session=session_data_bytes,  # Direct Session Data (bytes)
+                session=session_obj,  # <--- NAYA: StringSession object
                 api_id=config['api_id'], 
                 api_hash=config['api_hash'],
                 retry_delay=1
             )
             
-            # User Session start: Ab bot_token ki zaroorat nahi
+            # User Session start
             await client_instance.start()
             
             if await client_instance.is_user_authorized():
                  logging.info(f"User Session ({config['name']}) connected and authorized successfully!")
                  client_pool.append(client_instance)
             else:
-                 logging.error(f"User Session ({config['name']}) failed to authorize.")
+                 logging.error(f"User Session ({config['name']}) failed to authorize. (Check API ID/Hash and Session string match)")
 
-        except base64.binascii.Error:
-             logging.error(f"FATAL CONNECTION ERROR for {config['name']}: Base64 decoding failed. Check the session string.")
         except Exception as e:
+            # Ab hum sabhi errors ko general Exception mein catch kar rahe hain
             logging.error(f"FATAL CONNECTION ERROR for {config['name']}: {type(e).__name__}: {e}. Client will remain disconnected.")
             continue
     
@@ -1143,7 +1142,13 @@ async def shutdown_event():
     global client_pool
     for client_instance in client_pool:
         if client_instance:
-            logging.info(f"Closing Telegram Client connection for {client_instance.session.get_update_info().get('name', 'session')}...")
+            # Check kiya ki get_update_info hai ya nahi
+            try:
+                name = client_instance.session.get_update_info().get('name', 'session')
+            except:
+                name = 'session'
+                
+            logging.info(f"Closing Telegram Client connection for {name}...")
             await client_instance.disconnect()
 
 
@@ -1184,7 +1189,13 @@ async def _get_or_resolve_channel_entity(client_instance: TelegramClient):
         if resolved_channel_entity:
             return resolved_channel_entity
             
-        logging.info(f"LAZY RESOLVE: Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME} using {client_instance.session.get_update_info().get('name', 'client')}...")
+        # Check kiya ki session object mein get_update_info hai ya nahi
+        try:
+            client_name = client_instance.session.get_update_info().get('name', 'client')
+        except:
+            client_name = 'client'
+            
+        logging.info(f"LAZY RESOLVE: Resolving channel entity for {TEST_CHANNEL_ENTITY_USERNAME} using {client_name}...")
         try:
             resolved_channel_entity = await client_instance.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
             logging.info(f"LAZY RESOLVE SUCCESS: Channel resolved and cached.")
@@ -1206,8 +1217,13 @@ async def download_producer(
     Background mein Telegram se data download karke queue mein daalta hai (Producer)।
     """
     offset = start_offset
-    client_name = client_instance.session.get_update_info().get('name', 'client')
     
+    # Check kiya ki session object mein get_update_info hai ya nahi
+    try:
+        client_name = client_instance.session.get_update_info().get('name', 'client')
+    except:
+        client_name = 'client'
+        
     try:
         while offset <= end_offset:
             limit = min(chunk_size, end_offset - offset + 1)
@@ -1300,7 +1316,12 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if client_instance is None:
         raise HTTPException(status_code=503, detail="Telegram Client Pool is not connected or empty.")
         
-    client_name = client_instance.session.get_update_info().get('name', 'client')
+    # Check kiya ki session object mein get_update_info hai ya nahi
+    try:
+        client_name = client_instance.session.get_update_info().get('name', 'client')
+    except:
+        client_name = 'client'
+        
     logging.info(f"Using client: {client_name} for Message ID: {message_id}")
     
     # --- 2. Channel Resolution ---
@@ -1417,5 +1438,4 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             # client_instance pass kiya
             file_iterator(client_instance, file_entity_for_download, file_size, None, request),
             headers=headers
-        )
-        
+    )                            
