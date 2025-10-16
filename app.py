@@ -1108,12 +1108,15 @@ async def startup_event():
             continue
             
         try:
-            # ✅ FIX: Ab hum Base64 string ko StringSession object mein badlenge
-            session_obj = StringSession(config['session_b64'])
+             # 💡 FIX: Session string se pehle sabhi whitespace aur line breaks hatao (.strip() and .replace())
+            clean_session_string = config['session_b64'].strip().replace('\n', '')
+            
+            # StringSession object banao: clean string pass karo
+            session_obj = StringSession(clean_session_string) # <--- NAYI CLEAN STRING PASS KI
             
             # Client object banao: session=ab StringSession object pass karo
             client_instance = TelegramClient(
-                session=session_obj,  # <--- NAYA: StringSession object
+                session=session_obj,
                 api_id=config['api_id'], 
                 api_hash=config['api_hash'],
                 retry_delay=1
@@ -1126,16 +1129,15 @@ async def startup_event():
                  logging.info(f"User Session ({config['name']}) connected and authorized successfully!")
                  client_pool.append(client_instance)
             else:
+                 # Yahan authorization failed ho sakti hai agar API ID/Hash session se match nahi karta
                  logging.error(f"User Session ({config['name']}) failed to authorize. (Check API ID/Hash and Session string match)")
 
         except Exception as e:
-            # Ab hum sabhi errors ko general Exception mein catch kar rahe hain
             logging.error(f"FATAL CONNECTION ERROR for {config['name']}: {type(e).__name__}: {e}. Client will remain disconnected.")
             continue
     
     if not client_pool:
          logging.critical("CRITICAL: No Telegram User Sessions could connect. Service will be unavailable.")
-
 
 @app.on_event("shutdown")
 async def shutdown_event():
