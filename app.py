@@ -6,8 +6,8 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
-# FileReferenceExpiredError ko ab hum RPCError ke saath handle karenge (failure)
-from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError
+# BotMethodInvalidError ko bhi handle karna hoga agar Bot private channel mein get_messages call karta hai
+from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError, BotMethodInvalidError
 import logging
 import time
 from typing import Dict, Any, Optional
@@ -21,8 +21,7 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 
 # --- GLOBAL CONFIGURATION (USER SESSION & BOT POOL) ---
 
-# 1. USER SESSION CONFIG (Metadata Fetcher)
-# Iska kaam sirf channel entity resolve karna aur file reference nikalna hai.
+# 1. USER SESSION CONFIG (Owner - Sirf Connection Status ke liye)
 SESSION_FILE_OWNER = "owner.session"
 
 USER_SESSION_CONFIG = {
@@ -33,7 +32,6 @@ USER_SESSION_CONFIG = {
 }
 
 # 2. BOT POOL CONFIG (Download Workers)
-# Har bot download speed badhaega.
 BOT_TOKENS = [
     "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", # Aapka diya hua Bot Token
 ]
@@ -61,7 +59,7 @@ def get_next_bot_client() -> Optional[TelegramClient]:
 # --------------------------------------------------------
 
 # --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
-TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/+hPquYFblYHkxYzg1' 
+TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/hPquYFblYHkxYzg1' 
 OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
 BUFFER_CHUNK_COUNT = 4 
 
@@ -106,7 +104,7 @@ async def startup_event():
     asyncio.create_task(keep_alive_pinger())
     logging.info("PINGER: Keep-alive task scheduled.")
 
-    # --- 1. USER SESSION CONNECTION (Owner - Metadata Fetcher) ---
+    # --- 1. USER SESSION CONNECTION (Owner - Sirf connection ke liye) ---
     config = USER_SESSION_CONFIG
     session_file_path = config.get('session_file')
     client_name = config.get('name')
@@ -124,7 +122,7 @@ async def startup_event():
             await client_instance.start()
             
             if await client_instance.is_user_authorized():
-                 logging.info(f"User Session ({client_name}) connected and authorized successfully! (Role: Metadata Fetcher)")
+                 logging.info(f"User Session ({client_name}) connected and authorized successfully!")
                  owner_client = client_instance
             else:
                  logging.error(f"User Session ({client_name}) failed to authorize. (Session may be expired.)")
@@ -140,7 +138,7 @@ async def startup_event():
                                               api_hash=USER_SESSION_CONFIG['api_hash']).start(bot_token=token)
             
             bot_info = await bot_client.get_me()
-            logging.info(f"Bot Session (@{bot_info.username}) connected successfully! (Role: Download Worker)")
+            logging.info(f"Bot Session (@{bot_info.username}) connected successfully! (Role: Download Worker & Metadata Fetcher)")
             bot_client_pool.append(bot_client)
 
         except Exception as e:
@@ -148,11 +146,9 @@ async def startup_event():
     
     # Critical Check
     if not owner_client:
-         logging.critical("CRITICAL: Owner User Session could not connect. Metadata fetching will fail.")
+         logging.critical("CRITICAL: Owner User Session could not connect. Service may be unstable.")
     if not bot_client_pool:
          logging.critical("CRITICAL: No Bot Clients could connect. Downloading will fail.")
-    if not owner_client and not bot_client_pool:
-         logging.critical("CRITICAL: Service will be unavailable.")
 
 
 @app.on_event("shutdown")
@@ -189,19 +185,19 @@ async def root():
         if bot_client.is_connected():
             authorized_bots += 1
 
-    if owner_status and authorized_bots > 0:
-        status_msg = f"Streaming Proxy Active. Owner: Connected. Bots: {authorized_bots}/{len(BOT_TOKENS)}. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB). Metadata Cache TTL: {CACHE_TTL//60} mins."
+    if authorized_bots > 0:
+        status_msg = f"Streaming Proxy Active. Owner: {owner_status}. Bots: {authorized_bots}/{len(BOT_TOKENS)}. Target Channel: {TEST_CHANNEL_ENTITY_USERNAME}. Chunk Size: {chunk_mb}MB. Buffer: {BUFFER_CHUNK_COUNT} chunks ({total_buffer_mb}MB). Metadata Cache TTL: {CACHE_TTL//60} mins."
     else:
         status_msg = f"Streaming Proxy Active. Owner: {owner_status}. Bots: {authorized_bots}/{len(BOT_TOKENS)}. (503 Service Unavailable)."
 
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
-# 🚨 Download Producer (File Reference Refresh Hata Diya Gaya Hai) 🚨
+# 🚨 Download Producer (Purane Single-Bot Style mein: NO Refresh Logic) 🚨
 async def download_producer(
     client_instance: TelegramClient, # Initial client (Bot)
     file_entity, 
-    file_id_int: int, # Message ID integer (used for logging only)
+    file_id_int: int, # Message ID integer (logging ke liye)
     start_offset: int, 
     end_offset: int, 
     chunk_size: int, 
@@ -220,9 +216,9 @@ async def download_producer(
         
     
     # Hum seedhe download loop chalaenge
-    while offset <= end_offset:
-        
-        try:
+    try:
+        while offset <= end_offset:
+            
             limit = min(chunk_size, end_offset - offset + 1)
             
             # --- Download Attempt ---
@@ -239,20 +235,17 @@ async def download_producer(
                  logging.error(f"PRODUCER BREAK ({client_name}): Download loop finished before offset reached {end_offset}. Stopping.")
                  break 
         
-        # 💥 FIX: FileReferenceExpiredError ko RPCError ke saath pakad kar turant stream band kar do
-        except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
-            logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download. Stopping stream (NO REFRESH LOGIC).")
-            break
+    # 💥 FileReferenceExpiredError aane par, hum ise pakdenge aur turant stream band kar denge.
+    except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
+        logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download. Stopping stream (Old Single-Bot Style: NO REFRESH).")
         
-        except Exception as e:
-            logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
-            break
+    except Exception as e:
+        logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
     
     # FINAL: Queue ko hamesha band karo
     await queue.put(None)
 
 
-# 🚨 Signature Change: file_id_int add kiya gaya hai 🚨
 async def file_iterator(client_instance_for_download, file_entity_for_download, file_id_int, file_size, range_header, request: Request):
     """Queue se chunks nikalta hai aur FastAPI ko stream karta hai (Consumer)।"""
     start = 0
@@ -273,7 +266,6 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
     producer_task = asyncio.create_task(
-        # file_id_int pass kiya gaya hai
         download_producer(client_instance_for_download, file_entity_for_download, file_id_int, start, end, OPTIMAL_CHUNK_SIZE, queue)
     )
     
@@ -304,7 +296,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# FINAL FIX: stream_file_by_message_id (Metadata fetch is correctly done by Owner)
+# FINAL FIX: stream_file_by_message_id (Bot Metadata Fetching)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -313,32 +305,33 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     global owner_client, bot_client_pool
     
     # --- 1. Client Check aur Selection ---
-    if owner_client is None or not bot_client_pool:
-        raise HTTPException(status_code=503, detail="Telegram Clients are not connected or pool is empty.")
+    if not bot_client_pool:
+        raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
 
-    metadata_client = owner_client
+    # Ab download_client hi metadata client bhi hai
     download_client = get_next_bot_client() 
     
     if download_client is None:
         raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
         
     try:
-        metadata_client_name = metadata_client.session.filename if hasattr(metadata_client.session, 'filename') else 'owner'
         bot_client_name = (await download_client.get_me()).username
     except:
-        metadata_client_name = 'owner'
         bot_client_name = 'bot_worker'
 
-    logging.info(f"Metadata client: {metadata_client_name}. Download client: @{bot_client_name} for Message ID: {message_id}")
+    logging.info(f"Download/Metadata client: @{bot_client_name} for Message ID: {message_id}")
     
-    # --- 2. Channel Resolution (Owner Client se) ---
+    # --- 2. Channel Resolution (AB BOT CLIENT SE) ---
     resolved_entity = None
     try:
-        resolved_entity = await metadata_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by {metadata_client_name}.")
+        resolved_entity = await download_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by @{bot_client_name}.")
+    except BotMethodInvalidError as e:
+         logging.error(f"FATAL BOT PERMISSION ERROR: Bot cannot use get_entity on this channel. Error: {e}")
+         raise HTTPException(status_code=500, detail=f"Bot does not have permissions (BotMethodInvalidError) to resolve channel entity.")
     except Exception as e:
-        logging.error(f"FATAL RESOLUTION ERROR ({metadata_client_name}): Could not resolve target channel entity: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using {metadata_client_name}.")
+        logging.error(f"FATAL RESOLUTION ERROR (@{bot_client_name}): Could not resolve target channel entity: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using @{bot_client_name}.")
         
     # --- 3. Message ID Check ---
     try:
@@ -350,7 +343,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     file_title = f"movie_{message_id}.mkv" 
     file_entity_for_download = None 
     
-    # 🌟 Caching check and Metadata Fetch (Owner Client se)
+    # 🌟 Caching check and Metadata Fetch (AB BOT CLIENT SE)
     current_time = time.time()
     cached_data = FILE_METADATA_CACHE.get(file_id_int) 
     
@@ -362,12 +355,12 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
     else:
         # Cache Miss/Expired: API se naya data fetch karo
-        logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata using {metadata_client_name}...")
+        logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata using @{bot_client_name}...")
         
         # --- METADATA FETCHING ---
         try:
-            # Owner client se fresh reference aur metadata le rahe hain
-            message = await metadata_client.get_messages(resolved_entity, ids=file_id_int) 
+            # BOT client se fresh reference aur metadata le rahe hain
+            message = await download_client.get_messages(resolved_entity, ids=file_id_int) 
             
             media_entity = None
             if message and message.media:
@@ -403,10 +396,13 @@ async def stream_file_by_message_id(message_id: str, request: Request):
                 logging.error(f"Metadata FAILED: Message {file_id_int} not found or no suitable media.")
                 raise HTTPException(status_code=404, detail="File not found in the specified channel or is not a streamable media type.")
 
+        except BotMethodInvalidError as e:
+             logging.error(f"FATAL BOT PERMISSION ERROR: Bot cannot use get_messages on this channel. Error: {e}")
+             raise HTTPException(status_code=500, detail=f"Bot does not have permissions (BotMethodInvalidError) to fetch message metadata from this channel. Owner/User session required.")
         except HTTPException:
             raise
         except Exception as e:
-            logging.error(f"METADATA RESOLUTION ERROR ({metadata_client_name}): {type(e).__name__}: {e}.")
+            logging.error(f"METADATA RESOLUTION ERROR (@{bot_client_name}): {type(e).__name__}: {e}.")
             FILE_METADATA_CACHE.pop(file_id_int, None) 
             raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
@@ -438,7 +434,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             "Connection": "keep-alive"
         }
         return StreamingResponse(
-            # file_id_int pass kiya gaya hai
             file_iterator(download_client, file_entity_for_download, file_id_int, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
             headers=headers
@@ -454,7 +449,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         
         return StreamingResponse(
-            # file_id_int pass kiya gaya hai
             file_iterator(download_client, file_entity_for_download, file_id_int, file_size, None, request),
             headers=headers
         )
