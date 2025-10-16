@@ -38,7 +38,7 @@ BOT_TOKENS = [
 ]
 
 # Global pool aur counter
-owner_client: Optional[TelegramClient] = None # Single User Client
+owner_client: Optional[TelegramClient] = None # Single User Client (Global access ke liye)
 bot_client_pool: list[TelegramClient] = []   # Bot Clients ka Pool
 global_bot_counter = 0                       # Bot pool ke liye Round-Robin counter
 
@@ -95,7 +95,7 @@ async def keep_alive_pinger():
 
 
 # ----------------------------------------------------------------------
-# UPDATED startup_event function (Owner User Session aur Bot Pool ko connect karta hai)
+# UPDATED startup_event function
 # ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -134,6 +134,7 @@ async def startup_event():
     for token in BOT_TOKENS:
         try:
             # Bot token se connect karna
+            # Bot client ko USER_SESSION_CONFIG ki API ID/Hash use karni hogi
             bot_client = await TelegramClient(None, 
                                               api_id=USER_SESSION_CONFIG['api_id'], 
                                               api_hash=USER_SESSION_CONFIG['api_hash']).start(bot_token=token)
@@ -205,21 +206,23 @@ async def download_producer(
     queue: asyncio.Queue
 ):
     """Background mein Telegram se data download karke queue mein daalta hai (Producer)।"""
+    global owner_client # Owner client ko access karne ke liye
+
     offset = start_offset
+    max_retries = 3
+    retries = 0
     
     try:
-        if hasattr(client_instance.session, 'filename'):
-            client_name = client_instance.session.filename
-        else:
-            client_name = (await client_instance.get_me()).username # Bot Name
+        client_name = (await client_instance.get_me()).username if not hasattr(client_instance.session, 'filename') else client_instance.session.filename
     except:
         client_name = 'client/bot'
         
-    try:
-        while offset <= end_offset:
+    
+    while offset <= end_offset and retries < max_retries:
+        try:
             limit = min(chunk_size, end_offset - offset + 1)
             
-            # CRITICAL: Yahan Bot Client, Owner se mile File Entity ko use karke download karta hai.
+            # --- Download Attempt ---
             async for chunk in client_instance.iter_download(
                 file_entity, 
                 offset=offset,
@@ -232,15 +235,61 @@ async def download_producer(
             if offset <= end_offset:
                  logging.error(f"PRODUCER BREAK ({client_name}): Offset reached {offset}, target was {end_offset}. Stopping.")
                  break 
+            
+        except FileReferenceExpiredError:
+            retries += 1
+            logging.warning(f"PRODUCER WARNING ({client_name}): FileReferenceExpiredError (Retry {retries}/{max_retries}). Attempting to refresh reference using Owner...")
+            
+            if owner_client is None:
+                logging.error("PRODUCER FATAL: Owner client is disconnected. Cannot refresh reference.")
+                break
+
+            # --- File Reference Refresh Logic ---
+            try:
+                # Channel entity ko dobara resolve karne ki zaroorat nahi, sirf message fetch karo
+                refreshed_message = await owner_client.get_messages(
+                    TEST_CHANNEL_ENTITY_USERNAME, 
+                    ids=file_entity.id # Message ID se dobara fetch
+                ) 
+                
+                new_file_entity = None
+                if refreshed_message and refreshed_message.media:
+                    if hasattr(refreshed_message.media, 'document'):
+                        new_file_entity = refreshed_message.media.document
+                    elif hasattr(refreshed_message.media, 'video'):
+                        new_file_entity = refreshed_message.media.video
+                
+                # Check agar naya reference mil gaya hai
+                if new_file_entity and new_file_entity.file_reference:
+                    
+                    # File entity aur Cache ko update karo
+                    file_entity = new_file_entity 
+                    FILE_METADATA_CACHE[file_entity.id]['entity'] = new_file_entity
+                    FILE_METADATA_CACHE[file_entity.id]['timestamp'] = time.time() # Cache TTL refresh karo
+                    
+                    logging.info(f"PRODUCER: Reference refreshed successfully for {file_entity.id}. Resuming download from offset {offset}.")
+                    # Ab loop dobara chlega naye reference ke saath
+                    continue # Retry ke baad while loop dobara chalega
+                else:
+                    logging.error("PRODUCER FATAL: Failed to get new media entity during refresh.")
+                    break # Stop trying if refresh fails to provide a new entity
+
+            except Exception as ref_e:
+                logging.error(f"PRODUCER ERROR ({client_name}): Failed to refresh reference: {type(ref_e).__name__}. Retrying...")
+                await asyncio.sleep(2) # Thoda wait karo aur dobara try karo (agar max_retries baki ho)
+                continue # Retry
         
-    except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
-        # FileReferenceExpiredError aane par, cache miss/expired ho jana chahiye
-        logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download.")
-    except Exception as e:
-        logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
+        except (RPCError, TimeoutError, AuthKeyError) as e:
+            logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download.")
+            break
+        except Exception as e:
+            logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
+            break
     
-    finally:
-        await queue.put(None)
+    if retries >= max_retries:
+        logging.error(f"PRODUCER FAILED: Max retries ({max_retries}) reached for file {file_entity.id}.")
+
+    await queue.put(None)
 
 
 async def file_iterator(client_instance_for_download, file_entity_for_download, file_size, range_header, request: Request):
@@ -293,7 +342,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# FINAL FIX: stream_file_by_message_id (Metadata Owner se, Download Bot se, NameError fixed)
+# FINAL FIX: stream_file_by_message_id (NameError fixed)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -406,7 +455,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-    # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
+     # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
     if range_header:
         # Partial Content (206) response
         try:
@@ -417,7 +466,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             
         content_length = file_size - start_range
         
-        headers = { # <--- Headers defined for 206
+        headers = { 
             "Content-Type": content_type,
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
@@ -433,8 +482,8 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     else:
         # Full content request (200) response
         
-        # ✅ FIX: Yahan 'headers' ko define kiya gaya hai
-        headers = { # <--- Headers defined for 200 (Fix)
+        # ✅ FIX: headers define kiya gaya hai
+        headers = { 
             "Content-Type": content_type,
             "Content-Length": str(file_size),
             "Accept-Ranges": "bytes",
@@ -446,4 +495,3 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             file_iterator(download_client, file_entity_for_download, file_size, None, request),
             headers=headers
         )
-        
