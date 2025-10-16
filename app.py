@@ -6,6 +6,7 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
+# FileReferenceExpiredError ko ab hum RPCError ke saath handle karenge (failure)
 from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError
 import logging
 import time
@@ -196,43 +197,36 @@ async def root():
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
-# 🚨 Signature Change: file_id_int add kiya gaya hai 🚨
+# 🚨 Download Producer (File Reference Refresh Hata Diya Gaya Hai) 🚨
 async def download_producer(
     client_instance: TelegramClient, # Initial client (Bot)
     file_entity, 
-    file_id_int: int, # Message ID integer
+    file_id_int: int, # Message ID integer (used for logging only)
     start_offset: int, 
     end_offset: int, 
     chunk_size: int, 
     queue: asyncio.Queue
 ):
-    """Background mein Telegram se data download karke queue mein daalta hai (Producer)।"""
-    global owner_client 
-
+    """
+    Background mein Telegram se data download karke queue mein daalta hai (Producer)।
+    WARNING: Yeh function FileReferenceExpiredError ko handle nahi karta, isse stream ruk jayegi.
+    """
     offset = start_offset
-    max_retries = 3
-    retries = 0 # Retry counter
-    
-    current_client = client_instance # Local client instance jisko hum switch kar sakte hain
     
     try:
-        initial_client_name = (await client_instance.get_me()).username if not hasattr(client_instance.session, 'filename') else client_instance.session.filename
+        client_name = (await client_instance.get_me()).username
     except:
-        initial_client_name = 'client/bot'
+        client_name = 'bot_worker'
         
     
-    while offset <= end_offset and retries < max_retries:
+    # Hum seedhe download loop chalaenge
+    while offset <= end_offset:
         
-        try:
-            client_name = (await current_client.get_me()).username if not hasattr(current_client.session, 'filename') else current_client.session.filename
-        except:
-            client_name = 'Owner' if current_client is owner_client else initial_client_name
-
         try:
             limit = min(chunk_size, end_offset - offset + 1)
             
             # --- Download Attempt ---
-            async for chunk in current_client.iter_download( # Use current_client
+            async for chunk in client_instance.iter_download( 
                 file_entity, 
                 offset=offset,
                 limit=limit,
@@ -242,78 +236,18 @@ async def download_producer(
                 offset += len(chunk)
 
             if offset <= end_offset:
-                 logging.error(f"PRODUCER BREAK ({client_name}): Offset reached {offset}, target was {end_offset}. Stopping.")
+                 logging.error(f"PRODUCER BREAK ({client_name}): Download loop finished before offset reached {end_offset}. Stopping.")
                  break 
-            
-        except FileReferenceExpiredError:
-            
-            logging.warning(f"PRODUCER WARNING ({client_name}): FileReferenceExpiredError (Retry {retries+1}/{max_retries}). Attempting to refresh reference using current client...") # Log updated
-            
-            if owner_client is None:
-                logging.error("PRODUCER FATAL: Owner client is disconnected. Cannot switch/refresh.")
-                break
-
-            # --- File Reference Refresh Logic (CRITICAL FIX) ---
-            try:
-                # 💥 CRITICAL FIX: Owner ki jagah current_client (Bot) use karega
-                refreshed_message = await current_client.get_messages( 
-                    TEST_CHANNEL_ENTITY_USERNAME, 
-                    ids=file_id_int 
-                ) 
-                
-                new_file_entity = None
-                if refreshed_message and refreshed_message.media:
-                    if hasattr(refreshed_message.media, 'document'):
-                        new_file_entity = refreshed_message.media.document
-                    elif hasattr(refreshed_message.media, 'video'):
-                        new_file_entity = refreshed_message.media.video
-                
-                # Check agar naya reference mil gaya hai
-                if new_file_entity and new_file_entity.file_reference:
-                    
-                    # File entity aur Cache ko update karo
-                    file_entity = new_file_entity 
-                    # Cache ko update karne ke liye Owner client use ho sakta hai, reference use nahi hoga
-                    FILE_METADATA_CACHE[file_id_int]['entity'] = new_file_entity 
-                    FILE_METADATA_CACHE[file_id_int]['timestamp'] = time.time() 
-                    
-                    logging.info(f"PRODUCER: Reference refreshed successfully by {client_name} for {file_id_int}. Resuming download from offset {offset}.")
-                    
-                    retries = 0 # Success ke baad retries ko 0 par reset karo
-                    continue # Loop dobara chalu karo
-                else:
-                    logging.error("PRODUCER FATAL: Failed to get new media entity during refresh.")
-                    # Fallback logic neeche chalega
-                    
-            except Exception as ref_e:
-                # Fallback logic neeche chalega
-                logging.error(f"PRODUCER ERROR ({client_name}): Failed to refresh reference: {type(ref_e).__name__}: {ref_e}.")
-                
-            # --- FALLBACK LOGIC ---
-            retries += 1 
-            if retries >= max_retries and current_client is client_instance:
-                logging.warning("PRODUCER FALLBACK: Bot client failed repeatedly. Switching to Owner Client for final download.")
-                current_client = owner_client # Client ko Owner par switch karo
-                retries = 0 # Owner client ke liye retries ko reset karo
-                continue
-            elif retries >= max_retries:
-                # Agar Owner bhi fail ho gaya ya max retries bot ke saath khatam ho gaye
-                break
-            else:
-                # Agar retries baki hain aur switch nahi hua to wait karke dobara try karo
-                await asyncio.sleep(2) 
-                continue
         
-        except (RPCError, TimeoutError, AuthKeyError) as e:
-            logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download.")
+        # 💥 FIX: FileReferenceExpiredError ko RPCError ke saath pakad kar turant stream band kar do
+        except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
+            logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download. Stopping stream (NO REFRESH LOGIC).")
             break
+        
         except Exception as e:
             logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
             break
     
-    if retries >= max_retries:
-        logging.error(f"PRODUCER FAILED: Max retries ({max_retries}) reached for file {file_id_int} with final client {client_name}.")
-
     # FINAL: Queue ko hamesha band karo
     await queue.put(None)
 
@@ -370,7 +304,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# FINAL FIX: stream_file_by_message_id (Producer aur Iterator call update)
+# FINAL FIX: stream_file_by_message_id (Metadata fetch is correctly done by Owner)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -432,6 +366,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
         # --- METADATA FETCHING ---
         try:
+            # Owner client se fresh reference aur metadata le rahe hain
             message = await metadata_client.get_messages(resolved_entity, ids=file_id_int) 
             
             media_entity = None
@@ -456,7 +391,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
                             file_title = attr.file_name
                             break
                 
-                  # 🌟 Cache the fetched data (entity ke saath file_reference bhi cache ho jayega)
+                # 🌟 Cache the fetched data (entity ke saath file_reference bhi cache ho jayega)
                 FILE_METADATA_CACHE[file_id_int] = {
                     'size': file_size,
                     'title': file_title,
@@ -523,3 +458,4 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             file_iterator(download_client, file_entity_for_download, file_id_int, file_size, None, request),
             headers=headers
         )
+        
