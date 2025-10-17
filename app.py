@@ -37,8 +37,8 @@ USER_SESSION_CONFIG = {
 # 2. BOT POOL CONFIG (Download Workers)
 # Yahan sirf bot tokens add karne hain
 BOT_TOKENS = [
-    "8075063062:AAH8lWaA7yk6ucGnL7N5F_U87nR9FRwKv98", # Bot 1
-    "8175782707:AAEGhy1yEjnL9e583ruLDRuI5nZv_26MU",   # Bot 2
+    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", # Bot 1
+    "8175782707:AAEGhy1yEjnL9e583ruxLDdPuI5nZv_26MU",   # Bot 2
     # Naya bot add karne ke liye, token yahan daalein
 ]
 
