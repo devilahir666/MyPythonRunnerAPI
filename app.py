@@ -7,15 +7,13 @@ from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
 # Error handling ke liye saare zaroori imports (FileReferenceExpiredError is the key)
-from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError, BotMethodInvalidError
+from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError, BotMethodInvalidError, ChannelInvalidError
 import logging
 import time
 from typing import Dict, Any, Optional
 import httpx 
 import os 
-# telethon ke entities jaise Document, Video ke liye Any type
-from telethon.tl.types import Document, Channel
-
+from telethon.tl.types import Document, Channel 
 # ------------------------------------------
 
 # Set up logging 
@@ -35,10 +33,10 @@ USER_SESSION_CONFIG = {
 }
 
 # 2. BOT POOL CONFIG (Download Workers)
-# Yahan sirf bot tokens add karne hain
+# Kripya yahan apne valid bot tokens replace karein!
 BOT_TOKENS = [
-    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", # Bot 1
-    "8175782707:AAEGhy1yEjnL9e583ruxLDdPuI5nZv_26MU",   # Bot 2
+    "---Naya Token 1 Yahan Daalein---", 
+    "---Naya Token 2 Yahan Daalein---", 
     # Naya bot add karne ke liye, token yahan daalein
 ]
 
@@ -133,6 +131,10 @@ async def startup_event():
 
     # --- 2. BOT POOL CONNECTION (Workers) ---
     for token in BOT_TOKENS:
+        if token.startswith("---") and token.endswith("---"):
+            logging.warning("Skipping connection attempt: Found placeholder token. Please replace with a valid token.")
+            continue
+            
         try:
             bot_client = await TelegramClient(None, 
                                               api_id=USER_SESSION_CONFIG['api_id'], 
@@ -193,11 +195,11 @@ async def root():
 
 
 # ----------------------------------------------------------------------
-# 🔥 CORE FIX: ROBUST STREAMING ITERATOR (Handles Refresh & Client Switch) 🔥
+# 🔥 CORE FIX: ROBUST STREAMING ITERATOR (Uses Channel ID for Refresh) 🔥
 # ----------------------------------------------------------------------
 async def download_stream_iterator(
     message_id_int: int,                # Original Message ID
-    channel_entity: Any,                # Channel Entity
+    channel_id_int: int,                # FIX: Channel ID (Integer) for reliable refresh
     initial_file_entity: Any,           # Initial Document/Video Entity (with first file_reference)
     file_size: int,
     range_header: Optional[str],
@@ -231,7 +233,6 @@ async def download_stream_iterator(
 
     while current_offset <= end_offset and refresh_count < MAX_REFRESH_ATTEMPTS:
         # 1. Select the download worker client (Round-Robin)
-        # Har naya attempt ek naye bot se shuru hoga
         download_client = get_next_bot_client() 
         if not download_client:
             logging.error("STREAM ABORT: No active bot clients in the pool.")
@@ -288,14 +289,17 @@ async def download_stream_iterator(
                 if not refresh_client:
                     raise Exception("No client available for refreshing file reference.")
                     
-                message = await refresh_client.get_messages(channel_entity, ids=message_id_int)
+                # 🔥 FIX IMPLEMENTED: Channel ID (integer) use kiya jaa raha hai, entity object nahi.
+                message = await refresh_client.get_messages(channel_id_int, ids=message_id_int)
                 
                 new_entity = None
                 if message and message.media:
-                    if hasattr(message.media, 'document') and isinstance(message.media.document, Document):
+                    if hasattr(message.media, 'document') and message.media.document:
                         new_entity = message.media.document
-                    elif hasattr(message.media, 'video') and isinstance(message.media.video, Video):
-                        new_entity = message.media.video
+                    elif hasattr(message.media, 'video') and hasattr(message.media.video, 'size'):
+                         if hasattr(message.media, 'document') and message.media.document:
+                             new_entity = message.media.document
+
                         
                 if new_entity and hasattr(new_entity, 'file_reference') and new_entity.file_reference:
                     current_file_entity = new_entity 
@@ -303,9 +307,13 @@ async def download_stream_iterator(
                     logging.info(f"REFRESH SUCCESS: Entity updated (Client: {await refresh_client.get_me()}). Restarting download from offset {current_offset}.")
                     continue # Restart while loop
                 else:
-                    logging.error("REFRESH FAILED: New file entity/reference is invalid after refresh.")
+                    logging.error("REFRESH FAILED: New file entity/reference is invalid after refresh. Message type not supported for streaming.")
                     break
 
+            except ChannelInvalidError as refresh_error:
+                # Agar phir bhi invalid channel object ka error aaye, to URL ko check karna padega.
+                logging.critical(f"REFRESH CRITICAL FAILURE: ChannelInvalidError still occurred. Check TEST_CHANNEL_ENTITY_USERNAME or ensure the bot is a member of the channel. Error: {refresh_error}. Aborting stream.")
+                break
             except Exception as refresh_error:
                 logging.error(f"REFRESH CRITICAL FAILURE: {type(refresh_error).__name__}: {refresh_error}. Aborting stream.")
                 break
@@ -315,7 +323,7 @@ async def download_stream_iterator(
             break 
             
         except Exception as e:
-            logging.error(f"DOWNLOAD UNHANDLED EXCEPTION (@{client_name}): {e}. Aborting stream.")
+            logging.error(f"DOWNLOAD UNHANDLED EXCEPTION (@{client_client_name}): {e}. Aborting stream.")
             break
 
     if current_offset <= end_offset:
@@ -323,7 +331,7 @@ async def download_stream_iterator(
 
 
 # ----------------------------------------------------------------------
-# stream_file_by_message_id (Initial Metadata Fetch by the handling bot)
+# stream_file_by_message_id (Initial Metadata Fetch)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -335,7 +343,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         raise HTTPException(status_code=503, detail="Bot Download Pool is empty (Service Unavailable).")
 
     # --- 1. Client Check aur Selection ---
-    # Jis bot ko request mili, wohi metadata fetch karega (Round-Robin)
     metadata_client = get_next_bot_client() 
     
     if metadata_client is None:
@@ -348,11 +355,13 @@ async def stream_file_by_message_id(message_id: str, request: Request):
 
     logging.info(f"Request handled by: @{bot_client_name} for Message ID: {message_id}")
     
-    # --- 2. Channel Resolution ---
-    resolved_entity: Optional[Channel] = None
+    # --- 2. Channel Resolution (Entity aur ID dono nikalte hain) ---
+    channel_id_int: Optional[int] = None
     try:
         resolved_entity = await metadata_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by @{bot_client_name}.")
+        # ✅ FIX: Channel ID ko extract karo.
+        channel_id_int = resolved_entity.id 
+        logging.info(f"RESOLVE SUCCESS: Channel entity resolved to ID: {channel_id_int} by @{bot_client_name}.")
     except Exception as e:
         logging.error(f"FATAL RESOLUTION ERROR (@{bot_client_name}): Could not resolve target channel entity: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using @{bot_client_name}.")
@@ -367,7 +376,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     file_title = f"movie_{message_id}.mkv" 
     file_entity_for_download = None 
     
-    # 🌟 Caching check and Metadata Fetch (Wohi bot nikalega)
+    # 🌟 Caching check and Metadata Fetch
     current_time = time.time()
     cached_data = FILE_METADATA_CACHE.get(file_id_int) 
     range_header = request.headers.get("range")
@@ -379,18 +388,21 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         file_entity_for_download = cached_data['entity']
         
     else:
-        # Cache Miss/Expired: API se naya data fetch karo (Handling bot se)
+        # Cache Miss/Expired: API se naya data fetch karo
         logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata using @{bot_client_name}...")
         
         try:
-            message = await metadata_client.get_messages(resolved_entity, ids=file_id_int) 
+            # Channel ID (int) ya username use kar sakte hain
+            message = await metadata_client.get_messages(channel_id_int, ids=file_id_int) 
             
             media_entity = None
             if message and message.media:
                 if hasattr(message.media, 'document') and message.media.document:
                     media_entity = message.media.document
-                elif hasattr(message.media, 'video') and message.media.video:
-                    media_entity = message.media.video
+                elif hasattr(message.media, 'video') and hasattr(message.media.video, 'size'):
+                    if hasattr(message.media, 'document') and message.media.document:
+                        media_entity = message.media.document
+
             
             if media_entity and hasattr(media_entity, 'file_reference') and media_entity.file_reference:
                 file_size = media_entity.size
@@ -421,13 +433,13 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
     
-    # 4. Content Type aur Headers 
+        # 4. Content Type aur Headers 
     content_type = "application/octet-stream" 
     if file_title.lower().endswith((".mp4", ".m4v")): content_type = "video/mp4"
     elif file_title.lower().endswith((".mkv", ".webm")): content_type = "video/x-matroska"
     elif file_title.lower().endswith((".mp3", ".wav", ".ogg")): content_type = "audio/mpeg"
 
-       # 5. StreamingResponse (Using the robust iterator)
+    # 5. StreamingResponse (Using the robust iterator)
     if range_header:
         try:
             start_str = range_header.split('=')[1].split('-')[0]
@@ -448,7 +460,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         return StreamingResponse(
             download_stream_iterator(
                 file_id_int, 
-                resolved_entity, 
+                channel_id_int, # Passing integer ID
                 file_entity_for_download, 
                 file_size, 
                 range_header, 
@@ -470,7 +482,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         return StreamingResponse(
             download_stream_iterator(
                 file_id_int, 
-                resolved_entity, 
+                channel_id_int, # Passing integer ID
                 file_entity_for_download, 
                 file_size, 
                 None,
