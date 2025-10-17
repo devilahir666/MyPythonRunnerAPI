@@ -36,6 +36,7 @@ USER_SESSION_CONFIG = {
 BOT_TOKENS = [
     "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", # Bot 1 (Example)
     "8175782707:AAEGhy1yEjnL9e583ruxLDdPuI5nZv_26MU",    # Bot 2 (Example)
+"7811293412:AAFnE6GUxDkTIReP7tyUf4zGLMMoZ3jVR8k",
 ]
 
 # Global pool aur counter
