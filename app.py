@@ -33,7 +33,7 @@ USER_SESSION_CONFIG = {
 
 # 2. BOT POOL CONFIG (Download Workers)
 BOT_TOKENS = [
-    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", 
+    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98",
     "8175782707:AAEGhy1yEjnL9e583ruxLDdPuI5nZv_26MU",
     # Aapka diya hua Bot Token
     # Minimum 2 bots use karein segmented download ke liye
@@ -250,7 +250,7 @@ async def download_producer(
     await queue.put(None)
 
 
-# 🚨 Naya Iterator Function: Parallel Segmented Download (FIXED) 🚨
+# 🚨 Naya Iterator Function: Parallel Segmented Download (FIXED for client-specific reference) 🚨
 async def file_iterator_segmented(
     client_1, client_2, file_entity_for_download, file_id_int, file_size, range_header, request: Request
 ):
@@ -283,22 +283,50 @@ async def file_iterator_segmented(
     start_2 = mid_point + 1
     end_2 = end
     
+    # --- CLIENT-SPECIFIC ENTITY FETCH (FIX FOR FileReferenceExpiredError) ---
+    file_entity_1 = file_entity_for_download # Entity fetched by client_1 in stream_file_by_message_id
+    file_entity_2 = None 
+    
+    try:
+        # Client 2 ko apna khud ka file reference chahiye, isliye woh message dobara fetch karega
+        resolved_entity = await client_2.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+        message_2 = await client_2.get_messages(resolved_entity, ids=file_id_int) 
+        
+        # Media Entity nikalna
+        if message_2 and message_2.media:
+            if hasattr(message_2.media, 'document') and message_2.media.document:
+                file_entity_2 = message_2.media.document
+            elif hasattr(message_2.media, 'video') and message_2.media.video:
+                 file_entity_2 = message_2.media.video
+        
+        if not file_entity_2 or not hasattr(file_entity_2, 'file_reference') or not file_entity_2.file_reference:
+             logging.error("SEGMENTED FIX FAILED: Client 2 could not get a valid file reference. Falling back to single client.")
+             # Agar Bot 2 fail hota hai, toh usko Bot 1 ka client/entity de do (jisse Segment 2 fail hoga, but system rukega nahi)
+             client_2 = client_1
+             file_entity_2 = file_entity_1 
+             
+    except Exception as e:
+         logging.error(f"SEGMENTED FIX FAILED (Client 2 Entity Fetch): {e}. Falling back to single client.")
+         client_2 = client_1
+         file_entity_2 = file_entity_1 
+
+
     # --- ASYNC QUEUES ---
     queue_1 = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     queue_2 = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
-    # --- PRODUCERS LAUNCH ---
+    # --- PRODUCERS LAUNCH (Ab Bot 2 ka entity file_entity_2 hai) ---
     producer_task_1 = asyncio.create_task(
-        download_producer(client_1, file_entity_for_download, file_id_int, start_1, end_1, OPTIMAL_CHUNK_SIZE, queue_1, "Segment 1")
+        download_producer(client_1, file_entity_1, file_id_int, start_1, end_1, OPTIMAL_CHUNK_SIZE, queue_1, "Segment 1")
     )
     producer_task_2 = asyncio.create_task(
-        download_producer(client_2, file_entity_for_download, file_id_int, start_2, end_2, OPTIMAL_CHUNK_SIZE, queue_2, "Segment 2")
+        download_producer(client_2, file_entity_2, file_id_int, start_2, end_2, OPTIMAL_CHUNK_SIZE, queue_2, "Segment 2")
     )
     
-    # --- SEQUENTIAL CONSUMPTION (Bot 1 ka data, phir Bot 2 ka data) ---
+    # --- SEQUENTIAL CONSUMPTION ---
     all_tasks = [producer_task_1, producer_task_2]
     
-    # 🌟 FIX: Outer try block added to correctly use the final cleanup block
+    # FIX: Outer try block for cleanup
     try: 
         # 1. Yield Segment 1 (Bot 1 ka data)
         logging.info(f"CONSUMER: Starting stream for Segment 1 ({start_1}-{end_1})")
@@ -310,7 +338,7 @@ async def file_iterator_segmented(
                     
                 if await request.is_disconnected():
                     logging.info("Client disconnected during Segment 1 stream (Terminating iterator).")
-                    raise asyncio.CancelledError # Loop todne ke liye
+                    raise asyncio.CancelledError
                     
                 yield chunk
                 queue_1.task_done()
@@ -318,7 +346,7 @@ async def file_iterator_segmented(
                 logging.error("CONSUMER TIMEOUT: Segment 1 queue timed out (120s).")
                 break
             except asyncio.CancelledError:
-                 break # Disconnect par break
+                 break
 
         # 2. Yield Segment 2 (Bot 2 ka data)
         logging.info(f"CONSUMER: Starting stream for Segment 2 ({start_2}-{end_2})")
@@ -330,7 +358,7 @@ async def file_iterator_segmented(
                     
                 if await request.is_disconnected():
                     logging.info("Client disconnected during Segment 2 stream (Terminating iterator).")
-                    raise asyncio.CancelledError # Loop todne ke liye
+                    raise asyncio.CancelledError
                     
                 yield chunk
                 queue_2.task_done()
@@ -338,13 +366,12 @@ async def file_iterator_segmented(
                 logging.error("CONSUMER TIMEOUT: Segment 2 queue timed out (120s).")
                 break
             except asyncio.CancelledError:
-                 break # Disconnect par break
+                 break
         
     except Exception as e:
-         # Any other unexpected exception will be logged
          logging.error(f"CONSUMER UNHANDLED EXCEPTION: {e}") 
         
-    finally: # <--- Now correctly paired with the 'try' block
+    finally: 
         # Dono producer tasks ko cancel karo
         for task in all_tasks:
             if not task.done():
@@ -441,7 +468,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
                             file_title = attr.file_name
                             break
                 
-                # 🌟 Cache the fetched data 
+              # 🌟 Cache the fetched data 
                 FILE_METADATA_CACHE[file_id_int] = {
                     'size': file_size,
                     'title': file_title,
@@ -468,7 +495,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-       # 5. StreamingResponse (Naya Iterator Function use ho raha hai)
+    # 5. StreamingResponse (Naya Iterator Function use ho raha hai)
     if range_header:
         # Partial Content (206) response
         try:
