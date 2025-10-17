@@ -33,10 +33,9 @@ USER_SESSION_CONFIG = {
 
 # 2. BOT POOL CONFIG (Download Workers)
 BOT_TOKENS = [
-    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98",
+    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", 
     "8175782707:AAEGhy1yEjnL9e583ruxLDdPuI5nZv_26MU",
     # Aapka diya hua Bot Token
-    # Minimum 2 bots use karein segmented download ke liye
 ]
 
 # Global pool aur counter
@@ -196,7 +195,7 @@ async def root():
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
-# 🚨 Download Producer (Unchanged, but called twice with different offsets) 🚨
+# 🚨 Download Producer (Purane Single-Bot Style mein: NO Refresh Logic) 🚨
 async def download_producer(
     client_instance: TelegramClient, # Initial client (Bot)
     file_entity, 
@@ -204,11 +203,11 @@ async def download_producer(
     start_offset: int, 
     end_offset: int, 
     chunk_size: int, 
-    queue: asyncio.Queue,
-    segment_name: str # Naya: Debugging ke liye
+    queue: asyncio.Queue
 ):
     """
     Background mein Telegram se data download karke queue mein daalta hai (Producer)।
+    WARNING: Yeh function FileReferenceExpiredError ko handle nahi karta, isse stream ruk jayegi.
     """
     offset = start_offset
     
@@ -217,8 +216,7 @@ async def download_producer(
     except:
         client_name = 'bot_worker'
         
-    logging.info(f"PRODUCER START ({client_name} - {segment_name}): Offset {start_offset} to {end_offset}.")
-
+    
     # Hum seedhe download loop chalaenge
     try:
         while offset <= end_offset:
@@ -236,26 +234,22 @@ async def download_producer(
                 offset += len(chunk)
 
             if offset <= end_offset:
-                 logging.error(f"PRODUCER BREAK ({client_name} - {segment_name}): Download loop finished before offset reached {end_offset}. Stopping.")
+                 logging.error(f"PRODUCER BREAK ({client_name}): Download loop finished before offset reached {end_offset}. Stopping.")
                  break 
         
     # 💥 FileReferenceExpiredError aane par, hum ise pakdenge aur turant stream band kar denge.
     except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
-        logging.error(f"PRODUCER CRITICAL ERROR ({client_name} - {segment_name}): {type(e).__name__} during download. Stopping stream.")
+        logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download. Stopping stream (Old Single-Bot Style: NO REFRESH).")
         
     except Exception as e:
-        logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name} - {segment_name}): {e}")
+        logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
     
     # FINAL: Queue ko hamesha band karo
     await queue.put(None)
 
 
-# 🚨 Naya Iterator Function: Parallel Segmented Download (FIXED for client-specific reference) 🚨
-async def file_iterator_segmented(
-    client_1, client_2, file_entity_for_download, file_id_int, file_size, range_header, request: Request
-):
-    """Do bots ko istemaal karke file ko do hisson mein download aur stream karta hai (Consumer)।"""
-    
+async def file_iterator(client_instance_for_download, file_entity_for_download, file_id_int, file_size, range_header, request: Request):
+    """Queue se chunks nikalta hai aur FastAPI ko stream karta hai (Consumer)।"""
     start = 0
     end = file_size - 1
     
@@ -270,119 +264,41 @@ async def file_iterator_segmented(
             logging.warning(f"Invalid Range header format: {e}. Defaulting to full stream.")
             start = 0
             end = file_size - 1
+
+    queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
-    # --- SEGMENTATION LOGIC ---
-    total_length = end - start + 1
-    mid_point = start + total_length // 2 # File ko do barabar hisson mein baant diya
-    
-    # Segment 1 (Pehla Half)
-    start_1 = start
-    end_1 = mid_point
-    
-    # Segment 2 (Doosra Half)
-    start_2 = mid_point + 1
-    end_2 = end
-    
-    # --- CLIENT-SPECIFIC ENTITY FETCH (FIX FOR FileReferenceExpiredError) ---
-    file_entity_1 = file_entity_for_download # Entity fetched by client_1 in stream_file_by_message_id
-    file_entity_2 = None 
+    producer_task = asyncio.create_task(
+        download_producer(client_instance_for_download, file_entity_for_download, file_id_int, start, end, OPTIMAL_CHUNK_SIZE, queue)
+    )
     
     try:
-        # Client 2 ko apna khud ka file reference chahiye, isliye woh message dobara fetch karega
-        resolved_entity = await client_2.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-        message_2 = await client_2.get_messages(resolved_entity, ids=file_id_int) 
-        
-        # Media Entity nikalna
-        if message_2 and message_2.media:
-            if hasattr(message_2.media, 'document') and message_2.media.document:
-                file_entity_2 = message_2.media.document
-            elif hasattr(message_2.media, 'video') and message_2.media.video:
-                 file_entity_2 = message_2.media.video
-        
-        if not file_entity_2 or not hasattr(file_entity_2, 'file_reference') or not file_entity_2.file_reference:
-             logging.error("SEGMENTED FIX FAILED: Client 2 could not get a valid file reference. Falling back to single client.")
-             # Agar Bot 2 fail hota hai, toh usko Bot 1 ka client/entity de do (jisse Segment 2 fail hoga, but system rukega nahi)
-             client_2 = client_1
-             file_entity_2 = file_entity_1 
-             
-    except Exception as e:
-         logging.error(f"SEGMENTED FIX FAILED (Client 2 Entity Fetch): {e}. Falling back to single client.")
-         client_2 = client_1
-         file_entity_2 = file_entity_1 
-
-
-    # --- ASYNC QUEUES ---
-    queue_1 = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
-    queue_2 = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
-    
-    # --- PRODUCERS LAUNCH (Ab Bot 2 ka entity file_entity_2 hai) ---
-    producer_task_1 = asyncio.create_task(
-        download_producer(client_1, file_entity_1, file_id_int, start_1, end_1, OPTIMAL_CHUNK_SIZE, queue_1, "Segment 1")
-    )
-    producer_task_2 = asyncio.create_task(
-        download_producer(client_2, file_entity_2, file_id_int, start_2, end_2, OPTIMAL_CHUNK_SIZE, queue_2, "Segment 2")
-    )
-    
-    # --- SEQUENTIAL CONSUMPTION ---
-    all_tasks = [producer_task_1, producer_task_2]
-    
-    # FIX: Outer try block for cleanup
-    try: 
-        # 1. Yield Segment 1 (Bot 1 ka data)
-        logging.info(f"CONSUMER: Starting stream for Segment 1 ({start_1}-{end_1})")
         while True:
-            try:
-                chunk = await asyncio.wait_for(queue_1.get(), timeout=120) 
-                if chunk is None:
-                    break
-                    
-                if await request.is_disconnected():
-                    logging.info("Client disconnected during Segment 1 stream (Terminating iterator).")
-                    raise asyncio.CancelledError
-                    
-                yield chunk
-                queue_1.task_done()
-            except asyncio.TimeoutError:
-                logging.error("CONSUMER TIMEOUT: Segment 1 queue timed out (120s).")
+            chunk = await queue.get()
+            
+            if chunk is None:
                 break
-            except asyncio.CancelledError:
-                 break
+                
+            if await request.is_disconnected():
+                logging.info("Client disconnected during stream (Terminating iterator).")
+                break 
 
-        # 2. Yield Segment 2 (Bot 2 ka data)
-        logging.info(f"CONSUMER: Starting stream for Segment 2 ({start_2}-{end_2})")
-        while True:
-            try:
-                chunk = await asyncio.wait_for(queue_2.get(), timeout=120) 
-                if chunk is None:
-                    break
-                    
-                if await request.is_disconnected():
-                    logging.info("Client disconnected during Segment 2 stream (Terminating iterator).")
-                    raise asyncio.CancelledError
-                    
-                yield chunk
-                queue_2.task_done()
-            except asyncio.TimeoutError:
-                logging.error("CONSUMER TIMEOUT: Segment 2 queue timed out (120s).")
-                break
-            except asyncio.CancelledError:
-                 break
-        
+            yield chunk
+            queue.task_done()
+            
+    except asyncio.CancelledError:
+        logging.info("Iterator cancelled (Client disconnect or shutdown).")
     except Exception as e:
-         logging.error(f"CONSUMER UNHANDLED EXCEPTION: {e}") 
+        logging.error(f"CONSUMER UNHANDLED EXCEPTION: {e}")
+
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
         
-    finally: 
-        # Dono producer tasks ko cancel karo
-        for task in all_tasks:
-            if not task.done():
-                task.cancel()
-        
-        await asyncio.gather(*all_tasks, return_exceptions=True)
-        logging.info("CONSUMER: All producer tasks cleaned up.")
+        await asyncio.gather(producer_task, return_exceptions=True)
 
 
 # ----------------------------------------------------------------------
-# FINAL FIX: stream_file_by_message_id (AB DO BOTS CHUNNEGA)
+# FINAL FIX: stream_file_by_message_id (Bot Metadata Fetching)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -391,37 +307,37 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     global owner_client, bot_client_pool
     
     # --- 1. Client Check aur Selection ---
-    if len(bot_client_pool) < 1: 
+    if not bot_client_pool:
         raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
 
-    # 💡 Jugad: Do clients select karein.
-    download_client_1 = get_next_bot_client() 
-    download_client_2 = get_next_bot_client() 
+    # Ab download_client hi metadata client bhi hai
+    download_client = get_next_bot_client() 
     
-    if download_client_1 is None or download_client_2 is None:
-        raise HTTPException(status_code=503, detail="Bot Download Pool selection failed.")
+    if download_client is None:
+        raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
         
     try:
-        bot_1_name = (await download_client_1.get_me()).username
-        bot_2_name = (await download_client_2.get_me()).username
+        bot_client_name = (await download_client.get_me()).username
     except:
-        bot_1_name = 'bot_worker_1'
-        bot_2_name = 'bot_worker_2'
+        bot_client_name = 'bot_worker'
 
-    logging.info(f"Download/Metadata client: @{bot_1_name} & @{bot_2_name} for Message ID: {message_id}")
+    logging.info(f"Download/Metadata client: @{bot_client_name} for Message ID: {message_id}")
     
-    # --- 2. Channel Resolution (BOT CLIENT 1 SE) ---
+    # --- 2. Channel Resolution (AB BOT CLIENT SE) ---
     resolved_entity = None
     try:
-        resolved_entity = await download_client_1.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by @{bot_1_name}.")
+        resolved_entity = await download_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by @{bot_client_name}.")
+    except BotMethodInvalidError as e:
+         logging.error(f"FATAL BOT PERMISSION ERROR: Bot cannot use get_entity on this channel. Error: {e}")
+         raise HTTPException(status_code=500, detail=f"Bot does not have permissions (BotMethodInvalidError) to resolve channel entity.")
     except Exception as e:
-        logging.error(f"FATAL RESOLUTION ERROR (@{bot_1_name}): {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using @{bot_1_name}.")
+        logging.error(f"FATAL RESOLUTION ERROR (@{bot_client_name}): Could not resolve target channel entity: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using @{bot_client_name}.")
         
     # --- 3. Message ID Check ---
     try:
-        file_id_int = int(message_id) 
+        file_id_int = int(message_id) # Original message ID
     except ValueError:
         raise HTTPException(status_code=400, detail="Message ID must be a valid integer.")
 
@@ -429,7 +345,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     file_title = f"movie_{message_id}.mkv" 
     file_entity_for_download = None 
     
-    # 🌟 Caching check and Metadata Fetch (BOT CLIENT 1 SE)
+    # 🌟 Caching check and Metadata Fetch (AB BOT CLIENT SE)
     current_time = time.time()
     cached_data = FILE_METADATA_CACHE.get(file_id_int) 
     
@@ -440,11 +356,13 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         file_entity_for_download = cached_data['entity']
         
     else:
-        logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata using @{bot_1_name}...")
+        # Cache Miss/Expired: API se naya data fetch karo
+        logging.info(f"Cache MISS/EXPIRED for message {file_id_int}. Fetching metadata using @{bot_client_name}...")
         
-        # --- METADATA FETCHING (BOT 1) ---
+        # --- METADATA FETCHING ---
         try:
-            message = await download_client_1.get_messages(resolved_entity, ids=file_id_int) 
+            # BOT client se fresh reference aur metadata le rahe hain
+            message = await download_client.get_messages(resolved_entity, ids=file_id_int) 
             
             media_entity = None
             if message and message.media:
@@ -468,7 +386,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
                             file_title = attr.file_name
                             break
                 
-              # 🌟 Cache the fetched data 
+                # 🌟 Cache the fetched data (entity ke saath file_reference bhi cache ho jayega)
                 FILE_METADATA_CACHE[file_id_int] = {
                     'size': file_size,
                     'title': file_title,
@@ -480,10 +398,13 @@ async def stream_file_by_message_id(message_id: str, request: Request):
                 logging.error(f"Metadata FAILED: Message {file_id_int} not found or no suitable media.")
                 raise HTTPException(status_code=404, detail="File not found in the specified channel or is not a streamable media type.")
 
+        except BotMethodInvalidError as e:
+             logging.error(f"FATAL BOT PERMISSION ERROR: Bot cannot use get_messages on this channel. Error: {e}")
+             raise HTTPException(status_code=500, detail=f"Bot does not have permissions (BotMethodInvalidError) to fetch message metadata from this channel. Owner/User session required.")
         except HTTPException:
             raise
         except Exception as e:
-            logging.error(f"METADATA RESOLUTION ERROR (@{bot_1_name}): {type(e).__name__}: {e}.")
+            logging.error(f"METADATA RESOLUTION ERROR (@{bot_client_name}): {type(e).__name__}: {e}.")
             FILE_METADATA_CACHE.pop(file_id_int, None) 
             raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
@@ -495,7 +416,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-    # 5. StreamingResponse (Naya Iterator Function use ho raha hai)
+    # 5. StreamingResponse (Download Client ke roop mein Bot ko pass karna)
     if range_header:
         # Partial Content (206) response
         try:
@@ -515,13 +436,12 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             "Connection": "keep-alive"
         }
         return StreamingResponse(
-            # Naya Segmented Iterator call kiya gaya hai
-            file_iterator_segmented(download_client_1, download_client_2, file_entity_for_download, file_id_int, file_size, range_header, request), 
+            file_iterator(download_client, file_entity_for_download, file_id_int, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
             headers=headers
         )
     else:
-        # Full content request (200) response
+         # Full content request (200) response
         headers = { 
             "Content-Type": content_type,
             "Content-Length": str(file_size),
@@ -531,7 +451,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         
         return StreamingResponse(
-            # Naya Segmented Iterator call kiya gaya hai
-            file_iterator_segmented(download_client_1, download_client_2, file_entity_for_download, file_id_int, file_size, None, request),
+            file_iterator(download_client, file_entity_for_download, file_id_int, file_size, None, request),
             headers=headers
         )
+        
