@@ -14,7 +14,8 @@ from typing import Dict, Any, Optional
 import httpx 
 import os 
 # telethon ke entities jaise Document, Video ke liye Any type
-from telethon.tl.types import Document, Video, Channel
+from telethon.tl.types import Document, Channel
+
 # ------------------------------------------
 
 # Set up logging 
