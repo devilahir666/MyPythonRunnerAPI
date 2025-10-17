@@ -35,8 +35,8 @@ USER_SESSION_CONFIG = {
 # 2. BOT POOL CONFIG (Download Workers)
 # Kripya yahan apne valid bot tokens replace karein!
 BOT_TOKENS = [
-    "---Naya Token 1 Yahan Daalein---", 
-    "---Naya Token 2 Yahan Daalein---", 
+    "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", 
+    "8175782707:AAEGhy1yEjnL9e583ruxLDdPuI5nZv_26MU", 
     # Naya bot add karne ke liye, token yahan daalein
 ]
 
