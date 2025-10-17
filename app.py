@@ -36,7 +36,7 @@ BOT_TOKENS = [
     "8075063062:AAH8lWaA7yk6ucGnV7N5F_U87nR9FRwKv98", 
     "8175782707:AAEGhy1yEjnL9e583ruxLDdPuI5nZv_26MU",
     # Aapka diya hua Bot Token
-    # DUMMY TOKENS ADD KAR SAKTE HAIN YAHAN, MINIMUM 2 BOT CHAHIYE
+    # Minimum 2 bots use karein segmented download ke liye
 ]
 
 # Global pool aur counter
@@ -76,8 +76,6 @@ CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
 
 app = FastAPI(title="Telethon Async Streaming Proxy (User Session + Bot Pool)")
 
-# ... (startup_event, shutdown_event, root functions are unchanged) ...
-
 async def keep_alive_pinger():
     """Render Free Tier ko inactive hone se rokne ke liye self-ping karta hai।"""
     logging.info(f"PINGER: Background keep-alive task started (interval: {PINGER_DELAY_SECONDS}s). Target: {PUBLIC_SELF_PING_URL}")
@@ -99,7 +97,7 @@ async def keep_alive_pinger():
 
 
 # ----------------------------------------------------------------------
-# UPDATED startup_event function (Unchanged)
+# UPDATED startup_event function
 # ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -252,7 +250,7 @@ async def download_producer(
     await queue.put(None)
 
 
-# 🚨 Naya Iterator Function: Parallel Segmented Download 🚨
+# 🚨 Naya Iterator Function: Parallel Segmented Download (FIXED) 🚨
 async def file_iterator_segmented(
     client_1, client_2, file_entity_for_download, file_id_int, file_size, range_header, request: Request
 ):
@@ -286,7 +284,6 @@ async def file_iterator_segmented(
     end_2 = end
     
     # --- ASYNC QUEUES ---
-    # Har bot ke liye alag queue, taaki data sahi order mein nikal sake
     queue_1 = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     queue_2 = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
@@ -299,50 +296,55 @@ async def file_iterator_segmented(
     )
     
     # --- SEQUENTIAL CONSUMPTION (Bot 1 ka data, phir Bot 2 ka data) ---
-    
     all_tasks = [producer_task_1, producer_task_2]
     
-    # 1. Yield Segment 1 (Bot 1 ka data)
-    logging.info(f"CONSUMER: Starting stream for Segment 1 ({start_1}-{end_1})")
-    while True:
-        try:
-            chunk = await asyncio.wait_for(queue_1.get(), timeout=120) 
-            if chunk is None:
+    # 🌟 FIX: Outer try block added to correctly use the final cleanup block
+    try: 
+        # 1. Yield Segment 1 (Bot 1 ka data)
+        logging.info(f"CONSUMER: Starting stream for Segment 1 ({start_1}-{end_1})")
+        while True:
+            try:
+                chunk = await asyncio.wait_for(queue_1.get(), timeout=120) 
+                if chunk is None:
+                    break
+                    
+                if await request.is_disconnected():
+                    logging.info("Client disconnected during Segment 1 stream (Terminating iterator).")
+                    raise asyncio.CancelledError # Loop todne ke liye
+                    
+                yield chunk
+                queue_1.task_done()
+            except asyncio.TimeoutError:
+                logging.error("CONSUMER TIMEOUT: Segment 1 queue timed out (120s).")
                 break
-                
-            if await request.is_disconnected():
-                logging.info("Client disconnected during Segment 1 stream (Terminating iterator).")
-                raise asyncio.CancelledError # Loop todne ke liye
-                
-            yield chunk
-            queue_1.task_done()
-        except asyncio.TimeoutError:
-            logging.error("CONSUMER TIMEOUT: Segment 1 queue timed out (120s).")
-            break
-        except asyncio.CancelledError:
-             break # Disconnect par break
+            except asyncio.CancelledError:
+                 break # Disconnect par break
 
-    # 2. Yield Segment 2 (Bot 2 ka data)
-    logging.info(f"CONSUMER: Starting stream for Segment 2 ({start_2}-{end_2})")
-    while True:
-        try:
-            chunk = await asyncio.wait_for(queue_2.get(), timeout=120) 
-            if chunk is None:
+        # 2. Yield Segment 2 (Bot 2 ka data)
+        logging.info(f"CONSUMER: Starting stream for Segment 2 ({start_2}-{end_2})")
+        while True:
+            try:
+                chunk = await asyncio.wait_for(queue_2.get(), timeout=120) 
+                if chunk is None:
+                    break
+                    
+                if await request.is_disconnected():
+                    logging.info("Client disconnected during Segment 2 stream (Terminating iterator).")
+                    raise asyncio.CancelledError # Loop todne ke liye
+                    
+                yield chunk
+                queue_2.task_done()
+            except asyncio.TimeoutError:
+                logging.error("CONSUMER TIMEOUT: Segment 2 queue timed out (120s).")
                 break
-                
-            if await request.is_disconnected():
-                logging.info("Client disconnected during Segment 2 stream (Terminating iterator).")
-                raise asyncio.CancelledError # Loop todne ke liye
-                
-            yield chunk
-            queue_2.task_done()
-        except asyncio.TimeoutError:
-            logging.error("CONSUMER TIMEOUT: Segment 2 queue timed out (120s).")
-            break
-        except asyncio.CancelledError:
-             break # Disconnect par break
+            except asyncio.CancelledError:
+                 break # Disconnect par break
         
-    finally:
+    except Exception as e:
+         # Any other unexpected exception will be logged
+         logging.error(f"CONSUMER UNHANDLED EXCEPTION: {e}") 
+        
+    finally: # <--- Now correctly paired with the 'try' block
         # Dono producer tasks ko cancel karo
         for task in all_tasks:
             if not task.done():
@@ -362,19 +364,16 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     global owner_client, bot_client_pool
     
     # --- 1. Client Check aur Selection ---
-    if len(bot_client_pool) < 1: # Kam se kam 1 bot toh chahiye
+    if len(bot_client_pool) < 1: 
         raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
 
-    # 💡 Jugad: Do clients select karein. Agar pool mein 1 hi bot hai, toh wahi bot do baar milega.
+    # 💡 Jugad: Do clients select karein.
     download_client_1 = get_next_bot_client() 
     download_client_2 = get_next_bot_client() 
     
     if download_client_1 is None or download_client_2 is None:
         raise HTTPException(status_code=503, detail="Bot Download Pool selection failed.")
         
-    # Agar pool mein sirf 1 hi bot hai, toh dono client wahi honge, aur system 1 bot se hi segmented download karega (koi fayda nahi)
-    # Agar 2 ya zyada bot hain, toh do alag bots milenge (fayda milega)
-    
     try:
         bot_1_name = (await download_client_1.get_me()).username
         bot_2_name = (await download_client_2.get_me()).username
@@ -387,11 +386,9 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     # --- 2. Channel Resolution (BOT CLIENT 1 SE) ---
     resolved_entity = None
     try:
-        # Pehle bot se metadata nikalenge
         resolved_entity = await download_client_1.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
         logging.info(f"RESOLVE SUCCESS: Channel entity resolved by @{bot_1_name}.")
     except Exception as e:
-        # Error handling is unchanged
         logging.error(f"FATAL RESOLUTION ERROR (@{bot_1_name}): {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using @{bot_1_name}.")
         
@@ -409,7 +406,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     current_time = time.time()
     cached_data = FILE_METADATA_CACHE.get(file_id_int) 
     
-    # ... (Caching logic is unchanged) ...
     if cached_data and (current_time - cached_data['timestamp']) < CACHE_TTL:
         logging.info(f"Cache HIT for message {file_id_int}. Skipping Telegram API call.")
         file_size = cached_data['size']
@@ -465,14 +461,14 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
     
-    # 4. Range Handling aur Headers (unchanged)
+    # 4. Range Handling aur Headers 
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
     if file_title.endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.endswith(".mp4"): content_type = "video/mp4"
 
-      # 5. StreamingResponse (Naya Iterator Function use ho raha hai)
+       # 5. StreamingResponse (Naya Iterator Function use ho raha hai)
     if range_header:
         # Partial Content (206) response
         try:
