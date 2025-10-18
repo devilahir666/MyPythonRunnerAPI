@@ -234,9 +234,16 @@ async def download_producer(
         # Fresh message fetch karo
         messages = await client_instance.get_messages(resolved_entity, ids=file_id_int)
         
-        if messages and messages[0] and messages[0].media:
+        # ** FIX: Handle single Message object vs list of Messages **
+        message_obj = None
+        if isinstance(messages, list) and messages:
+            message_obj = messages[0]
+        else:
+            message_obj = messages
+            
+        if message_obj and message_obj.media:
             # Document ya Video entity nikalna
-            file_entity = messages[0].media.document or messages[0].media.video
+            file_entity = message_obj.media.document or message_obj.media.video
             
         if not file_entity or not hasattr(file_entity, 'file_reference') or not file_entity.file_reference:
             logging.error(f"PRODUCER FATAL: Message {file_id_int} is missing media or a valid File Reference.")
@@ -406,15 +413,21 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     
     try:
         # BOT client से सिर्फ साइज़/टाइटल निकालने के लिए
-        resolved_entity = await fetch_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-        message = await fetch_client.get_messages(resolved_entity, ids=file_id_int) 
+        messages = await fetch_client.get_messages(TEST_CHANNEL_ENTITY_USERNAME, ids=file_id_int) 
         
+        # ** FIX: Handle single Message object vs list of Messages **
+        message_obj = None
+        if isinstance(messages, list) and messages:
+            message_obj = messages[0]
+        else:
+            message_obj = messages
+
         media_entity = None
-        if message and message.media:
-            if hasattr(message.media, 'document') and message.media.document:
-                 media_entity = message.media.document
-            elif hasattr(message.media, 'video') and message.media.video:
-                 media_entity = message.media.video
+        if message_obj and message_obj.media:
+            if hasattr(message_obj.media, 'document') and message_obj.media.document:
+                 media_entity = message_obj.media.document
+            elif hasattr(message_obj.media, 'video') and message_obj.media.video:
+                 media_entity = message_obj.media.video
 
         
         if media_entity and hasattr(media_entity, 'size'):
@@ -472,7 +485,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             headers=headers
         )
     else:
-        # Full content request (200) response
+             # Full content request (200) response
         headers = { 
             "Content-Type": content_type,
             "Content-Length": str(file_size),
