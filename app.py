@@ -212,7 +212,7 @@ async def download_producer(
     queue: asyncio.Queue
 ):
     """
-    Producer ab खुद Download शुरू करने से ठीक पहले File Reference Fetch करता है।
+    Producer ab खुद Download शुरू करने से ठीक पहले File Reference Fetch karta hai।
     यह File Reference Expiration के कारण होने वाली 0.00KB समस्या को ठीक करता है।
     """
     offset = start_offset
@@ -411,7 +411,11 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         
         media_entity = None
         if message and message.media:
-            media_entity = message.media.document or message.media.video
+            if hasattr(message.media, 'document') and message.media.document:
+                 media_entity = message.media.document
+            elif hasattr(message.media, 'video') and message.media.video:
+                 media_entity = message.media.video
+
         
         if media_entity and hasattr(media_entity, 'size'):
             file_size = media_entity.size
@@ -463,22 +467,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         return StreamingResponse(
             # Producer को अब सिर्फ ID और Channel Name पास किया गया है
-            file_iterator(fetch_client, file_id_int, file_size, range_header, request), 
-            status_code=status.HTTP_206_PARTIAL_CONTENT,
-            headers=headers
-        )
-    else:
-        # Full content request (200) response
-        headers = { 
-            "Content-Type": content_type,
-            "Content-Length": str(file_size),
-            "Accept-Ranges": "bytes",
-            "Content-Disposition": f"inline; filename=\"{file_title}\"",
-            "Connection": "keep-alive"
-        }
-        
-        return StreamingResponse(
-             # Producer को अब सिर्फ ID और Channel Name पास किया गया है
             file_iterator(fetch_client, file_id_int, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
             headers=headers
