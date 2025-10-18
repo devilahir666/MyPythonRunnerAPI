@@ -7,9 +7,7 @@ from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
 # MTProto Hack ke liye naya import
-# Note: GetFileRequest ko 'telethon.tl.functions.upload' se import karna zaroori hai
 from telethon.tl.functions.upload import GetFileRequest
-# MTProto File Location Types
 from telethon.tl.types import InputDocumentFileLocation, InputFileLocation, InputPeerPhotoFileLocation, InputPhotoFileLocation, InputWebFileLocation
 from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError, BotMethodInvalidError
 import logging
@@ -275,8 +273,15 @@ async def download_producer(
         logging.info(f"PRODUCER END ({client_name}): Successfully reached end_offset {end_offset}.")
         
     # 💥 FileReferenceExpiredError aane par, stream band kar denge.
-    except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
-        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): {type(e).__name__} during MTProto download. Stopping stream.")
+    except FileReferenceExpiredError as e:
+        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): FILE REFERENCE EXPIRED. Need to re-fetch metadata. Stopping stream. {e}")
+        
+    except RPCError as e:
+        # RPC Error ko detail mein log karo
+        logging.error(f"PRODUCER CRITICAL RPC ERROR (@{client_name}): Code={e.code}, Name={e.name}, Message={e.message}. Stopping stream.")
+        
+    except (TimeoutError, AuthKeyError) as e:
+        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): Connection/Auth Error: {type(e).__name__}. Stopping stream.")
         
     except Exception as e:
         logging.error(f"PRODUCER UNHANDLED EXCEPTION (@{client_name}): {type(e).__name__}: {e}")
@@ -449,8 +454,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         logging.error(f"METADATA RESOLUTION ERROR (@{bot_client_name}): {type(e).__name__}: {e}.")
         FILE_METADATA_CACHE.pop(file_id_int, None) 
         raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
-        
-       # 6. Range Handling aur Headers (Remaining logic same rahega)
+          # 6. Range Handling aur Headers (Remaining logic same rahega)
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
