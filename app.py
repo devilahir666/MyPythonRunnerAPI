@@ -7,7 +7,10 @@ from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
 # MTProto Hack ke liye naya import
+# Note: GetFileRequest ko 'telethon.tl.functions.upload' se import karna zaroori hai
 from telethon.tl.functions.upload import GetFileRequest
+# MTProto File Location Types
+from telethon.tl.types import InputDocumentFileLocation, InputFileLocation, InputPeerPhotoFileLocation, InputPhotoFileLocation, InputWebFileLocation
 from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError, BotMethodInvalidError
 import logging
 import time
@@ -205,7 +208,7 @@ async def root():
 # 🚨 UPDATED DOWNLOAD PRODUCER (MTProto HACK - Raw GetFileRequest) 🚨
 async def download_producer(
     client_instance: TelegramClient, # Initial client (Bot)
-    file_entity, 
+    file_entity, # Yeh ab Document ya Video object hoga
     file_id_int: int, # Message ID integer (logging ke liye)
     start_offset: int, 
     end_offset: int, 
@@ -225,10 +228,25 @@ async def download_producer(
         
     logging.info(f"PRODUCER START (@{client_name}): Streaming range {start_offset} - {end_offset} for file {file_id_int}.")
     
-    try:
-        # File entity se MTProto location object nikalna
-        location = client_instance.get_file_location_location(file_entity)
+    # --- FIX START: Correctly generate the MTProto File Location ---
+    location: Optional[InputFileLocation] = None
+    
+    # Media entity (Document/Video) se location nikalna
+    if hasattr(file_entity, 'id') and hasattr(file_entity, 'access_hash') and hasattr(file_entity, 'file_reference'):
+        # Ye 'InputDocumentFileLocation' ke liye hai
+        location = InputDocumentFileLocation(
+            id=file_entity.id,
+            access_hash=file_entity.access_hash,
+            file_reference=file_entity.file_reference
+        )
+    else:
+        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): File entity is missing required MTProto attributes (id/hash/ref).")
+        await queue.put(None)
+        return
         
+    # --- FIX END: Correctly generate the MTProto File Location ---
+    
+    try:
         while offset <= end_offset:
             
             # Kitne bytes maangne hain (end_offset tak ya OPTIMAL_CHUNK_SIZE)
@@ -386,19 +404,21 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             if hasattr(message.media, 'document') and message.media.document:
                 media_entity = message.media.document
             elif hasattr(message.media, 'video') and message.media.video:
-                # Video entities mein bhi document object ho sakta hai, ya sirf video
-                # Hum FileReference ke liye Document ya Video object ko target karte hain
-                if hasattr(message.media, 'document') and message.media.document:
-                    media_entity = message.media.document
-                elif hasattr(message.media, 'video') and message.media.video:
-                    media_entity = message.media.video
+                # Agar video entity hai, to hum usko hi use kar sakte hain
+                media_entity = message.media.video
+            
+            # Agar sirf Photo (thumbnail) hai toh woh streamable nahi hota, but hum fir bhi document/video hi dekhenge
+            if not media_entity and hasattr(message.media, 'document'):
+                 media_entity = message.media.document
+            
         
         if media_entity:
             # Agar cache miss/expired tha, toh fresh size aur title update karo
-            if file_size == 0:
+            if file_size == 0 and hasattr(media_entity, 'size'):
                 file_size = media_entity.size
                 
-                if media_entity.attributes:
+                # File title Document/Video attributes se nikalna
+                if hasattr(media_entity, 'attributes'):
                     for attr in media_entity.attributes:
                         if hasattr(attr, 'file_name'):
                             file_title = attr.file_name
@@ -430,8 +450,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         FILE_METADATA_CACHE.pop(file_id_int, None) 
         raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
         
-    
-    # 6. Range Handling aur Headers (Remaining logic same rahega)
+       # 6. Range Handling aur Headers (Remaining logic same rahega)
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
@@ -454,7 +473,7 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             
         content_length = file_size - start_range
         
-           # Ab hum 'file_size - 1' tak hi jayenge, na ki file_size tak.
+         # Ab hum 'file_size - 1' tak hi jayenge, na ki file_size tak.
         # HTTP range 0-based indexing use karta hai (e.g., 0-999 for 1000 bytes).
         end_range_for_header = file_size - 1 
         
