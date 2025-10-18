@@ -8,8 +8,8 @@ from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
 # MTProto Hack ke liye naya import
 from telethon.tl.functions.upload import GetFileRequest
-from telethon.tl.types import InputDocumentFileLocation, InputFileLocation, InputPeerPhotoFileLocation, InputPhotoFileLocation, InputWebFileLocation
-from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError, BotMethodInvalidError
+from telethon.tl.types import InputDocumentFileLocation, InputFileLocation
+from telethon.errors import RPCError, FileReferenceExpiredError, FloodWaitError
 import logging
 import time
 from typing import Dict, Any, Optional
@@ -69,13 +69,13 @@ def get_next_bot_client() -> Optional[TelegramClient]:
 
 # --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
 TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/hPquYFblYHkxYzg1' 
-OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size (MTProto ke liye max 1MB se thoda zyada)
+OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size 
 BUFFER_CHUNK_COUNT = 4 
 
 # ** PINGER CONFIGURATION **
 PINGER_DELAY_SECONDS = 120
-PUBLIC_SELF_PING_URL = "https://telegram-stream-proxy-x63x.onrender.com/"
-# Metadata Caching Setup (Ab sirf size aur title cache karega)
+PUBLIC_SELF_PING_URL = "https://telegram-stream-proxy-x63x.onrender.com/" 
+# Metadata Caching Setup (Sirf size aur title cache karega)
 FILE_METADATA_CACHE: Dict[int, Dict[str, Any]] = {}
 CACHE_TTL = 3600 # 60 minutes tak cache rakhenge
 # -------------------------------
@@ -102,8 +102,6 @@ async def keep_alive_pinger():
                  logging.error(f"PINGER: Self-Heartbeat General Error: {type(e).__name__}: {e}")
 
 
-# ----------------------------------------------------------------------
-# UPDATED startup_event function
 # ----------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
@@ -203,53 +201,69 @@ async def root():
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
-# 🚨 UPDATED DOWNLOAD PRODUCER (MTProto HACK - Raw GetFileRequest) 🚨
+# 🚨 UPDATED DOWNLOAD PRODUCER WITH FRESH REFERENCE FETCH 🚨
 async def download_producer(
     client_instance: TelegramClient, # Initial client (Bot)
-    file_entity, # Yeh ab Document ya Video object hoga
-    file_id_int: int, # Message ID integer (logging ke liye)
+    file_id_int: int, # Message ID integer
+    channel_entity_username: str, # Channel username
     start_offset: int, 
     end_offset: int, 
     chunk_size: int, 
     queue: asyncio.Queue
 ):
     """
-    Background mein Telegram se data download karke queue mein daalta hai (Producer)।
-    Yeh direct MTProto `upload.GetFileRequest` call karta hai sirf maangi hui bytes ke liye।
+    Producer ab खुद Download शुरू करने से ठीक पहले File Reference Fetch करता है।
+    यह File Reference Expiration के कारण होने वाली 0.00KB समस्या को ठीक करता है।
     """
     offset = start_offset
+    MAX_RETRIES = 3 # Download RPC ke liye max retry attempts
     
     try:
         client_name = (await client_instance.get_me()).username
     except:
         client_name = 'bot_worker'
         
-    logging.info(f"PRODUCER START (@{client_name}): Streaming range {start_offset} - {end_offset} for file {file_id_int}.")
+    logging.info(f"PRODUCER START (@{client_name}): Streaming range {start_offset} - {end_offset} for file {file_id_int}. Fetching FRESH File Reference...")
     
-    # --- FIX START: Correctly generate the MTProto File Location ---
-    location: Optional[InputFileLocation] = None
-    
-    # Media entity (Document/Video) se location nikalna
-    if hasattr(file_entity, 'id') and hasattr(file_entity, 'access_hash') and hasattr(file_entity, 'file_reference'):
-        # Ye 'InputDocumentFileLocation' ke liye hai
+    # --- STEP 1: FRESH FILE REFERENCE FETCH ---
+    file_entity = None
+    try:
+        # Channel entity resolve karna (producer ke andar)
+        resolved_entity = await client_instance.get_entity(channel_entity_username)
+        
+        # Fresh message fetch karo
+        messages = await client_instance.get_messages(resolved_entity, ids=file_id_int)
+        
+        if messages and messages[0] and messages[0].media:
+            # Document ya Video entity nikalna
+            file_entity = messages[0].media.document or messages[0].media.video
+            
+        if not file_entity or not hasattr(file_entity, 'file_reference') or not file_entity.file_reference:
+            logging.error(f"PRODUCER FATAL: Message {file_id_int} is missing media or a valid File Reference.")
+            await queue.put(None)
+            return
+
+        logging.info(f"PRODUCER REFERENCE SUCCESS: Fresh File Reference fetched by @{client_name}.")
+
+    except Exception as e:
+        logging.error(f"PRODUCER REFERENCE ERROR (@{client_name}): Could not fetch initial File Entity: {type(e).__name__}: {e}.")
+        await queue.put(None)
+        return
+
+    # --- STEP 2: DOWNLOAD LOOP (USING FRESH REFERENCE) ---
+    retry_count = 0
+    while offset <= end_offset:
+        
+        limit = min(chunk_size, end_offset - offset + 1)
+        
+        # Location hamesha current, fresh file_entity se banegi
         location = InputDocumentFileLocation(
             id=file_entity.id,
             access_hash=file_entity.access_hash,
             file_reference=file_entity.file_reference
         )
-    else:
-        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): File entity is missing required MTProto attributes (id/hash/ref).")
-        await queue.put(None)
-        return
         
-    # --- FIX END: Correctly generate the MTProto File Location ---
-    
-    try:
-        while offset <= end_offset:
-            
-            # Kitne bytes maangne hain (end_offset tak ya OPTIMAL_CHUNK_SIZE)
-            limit = min(chunk_size, end_offset - offset + 1)
-            
+        try:
             # --- MTProto Hack: Raw upload.GetFileRequest Call ---
             result = await client_instance(
                 GetFileRequest(
@@ -259,38 +273,47 @@ async def download_producer(
                 )
             )
             
-            # Telegram se bytes (.bytes) extract karna
             chunk = result.bytes 
             
-            if not chunk:
-                # Agar Telegram ne empty response di aur hum end_offset tak nahi pahuche, toh error.
-                logging.error(f"PRODUCER BREAK ({client_name}): Empty chunk received at offset {offset}. Stopping stream.")
-                break 
+            if not chunk and limit > 0:
+                # 💥 SILENT FAILURE CATCH (0.00KB issue)
+                if retry_count < MAX_RETRIES - 1:
+                    # Retry karo, ho sakta hai network brief time ke liye hung ho
+                    logging.warning(f"PRODUCER RETRY ({client_name}): Empty chunk received at offset {offset}. Retrying Download RPC... ({retry_count + 1}/{MAX_RETRIES})")
+                    retry_count += 1
+                    await asyncio.sleep(1.5) 
+                    continue
+                else:
+                    logging.error(f"PRODUCER BREAK ({client_name}): Empty chunk received after max download retries. Stopping stream.")
+                    break
             
+            # --- Success ---
             await queue.put(chunk)
             offset += len(chunk)
+            retry_count = 0 # Success, reset retry counter
         
-        logging.info(f"PRODUCER END ({client_name}): Successfully reached end_offset {end_offset}.")
-        
-    # 💥 FileReferenceExpiredError aane par, stream band kar denge.
-    except FileReferenceExpiredError as e:
-        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): FILE REFERENCE EXPIRED. Need to re-fetch metadata. Stopping stream. {e}")
-        
-    except RPCError as e:
-        # RPC Error ko detail mein log karo
-        logging.error(f"PRODUCER CRITICAL RPC ERROR (@{client_name}): Code={e.code}, Name={e.name}, Message={e.message}. Stopping stream.")
-        
-    except (TimeoutError, AuthKeyError) as e:
-        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): Connection/Auth Error: {type(e).__name__}. Stopping stream.")
-        
-    except Exception as e:
-        logging.error(f"PRODUCER UNHANDLED EXCEPTION (@{client_name}): {type(e).__name__}: {e}")
+        # 💥 FileReferenceExpiredError (Explicit Error)
+        except FileReferenceExpiredError as e:
+             # Agar download ke beech mein expire hota hai, toh yeh fatal hai
+            logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): FILE REFERENCE EXPIRED DURING STREAMING. Stopping. {e}")
+            break
+            
+        except RPCError as e:
+            # Other RPC Errors (like FloodWait)
+            logging.error(f"PRODUCER CRITICAL RPC ERROR (@{client_name}): Code={e.code}, Name={e.name}, Message={e.message}. Stopping stream.")
+            break
+            
+        # 💥 Catch all other exceptions 
+        except Exception as e:
+            logging.error(f"PRODUCER UNHANDLED FATAL EXCEPTION (@{client_name}): {type(e).__name__}: {e}. Stopping stream.")
+            break
     
     # FINAL: Queue ko hamesha band karo
+    logging.info(f"PRODUCER END ({client_name}): Download loop finished.")
     await queue.put(None)
 
 
-async def file_iterator(client_instance_for_download, file_entity_for_download, file_id_int, file_size, range_header, request: Request):
+async def file_iterator(client_instance_for_download, file_id_int, file_size, range_header, request: Request):
     """Queue se chunks nikalta hai aur FastAPI ko stream karta hai (Consumer)।"""
     start = 0
     end = file_size - 1
@@ -309,8 +332,9 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
     queue = asyncio.Queue(maxsize=BUFFER_CHUNK_COUNT)
     
+    # PRODUCER अब केवल ID और Channel Username लेता है
     producer_task = asyncio.create_task(
-        download_producer(client_instance_for_download, file_entity_for_download, file_id_int, start, end, OPTIMAL_CHUNK_SIZE, queue)
+        download_producer(client_instance_for_download, file_id_int, TEST_CHANNEL_ENTITY_USERNAME, start, end, OPTIMAL_CHUNK_SIZE, queue)
     )
     
     try:
@@ -340,13 +364,13 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# 🔥 stream_file_by_message_id (Metadata Fetching)
+# 🔥 stream_file_by_message_id (Metadata Fetching ONLY for HTTP Headers)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
     """
-    Telegram Message ID se file stream karta hai.
-    FIX: Har request par, selected bot hamesha fresh file reference fetch karega.
+    Message ID से file size और title fetch करता है (Headers के लिए)।
+    File Reference fetching का काम अब Producer को दे दिया गया है।
     """
     
     global owner_client, bot_client_pool
@@ -355,30 +379,20 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     if not bot_client_pool:
         raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
 
-    # Download client Round-Robin se select kiya gaya
-    download_client = get_next_bot_client() 
+    # Metadata Fetching के लिए client select किया गया
+    fetch_client = get_next_bot_client() 
     
-    if download_client is None:
+    if fetch_client is None:
         raise HTTPException(status_code=503, detail="Bot Download Pool is empty.")
         
     try:
-        bot_client_name = (await download_client.get_me()).username
+        bot_client_name = (await fetch_client.get_me()).username
     except:
         bot_client_name = 'bot_worker'
 
-    logging.info(f"Download/Metadata client: @{bot_client_name} for Message ID: {message_id}")
+    logging.info(f"Metadata client: @{bot_client_name} for Message ID: {message_id}")
     
-    # --- 2. Channel Resolution (AB BOT CLIENT SE) ---
-    resolved_entity = None
-    try:
-        # Channel entity resolve karna (yahan koi reference issue nahi hai)
-        resolved_entity = await download_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
-        logging.info(f"RESOLVE SUCCESS: Channel entity resolved by @{bot_client_name}.")
-    except Exception as e:
-        logging.error(f"FATAL RESOLUTION ERROR (@{bot_client_name}): {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not resolve target channel entity using @{bot_client_name}.")
-        
-    # --- 3. Message ID Check ---
+    # --- 2. Message ID Check ---
     try:
         file_id_int = int(message_id)
     except ValueError:
@@ -386,87 +400,48 @@ async def stream_file_by_message_id(message_id: str, request: Request):
 
     file_size = 0
     file_title = f"movie_{message_id}.mkv" 
-    file_entity_for_download = None 
     
-    # --- 4. CACHE CHECK (Only size/title ke liye) ---
-    current_time = time.time()
-    cached_data = FILE_METADATA_CACHE.get(file_id_int) 
-    
-    if cached_data and (current_time - cached_data['timestamp']) < CACHE_TTL:
-        logging.info(f"Cache HIT for message {file_id_int}. Using cached size/title.")
-        file_size = cached_data['size']
-        file_title = cached_data['title']
-    
-    # --- 5. METADATA FETCHING (JUGAD: Always fetch entity for current bot) ---
-    logging.info(f"Fetching fresh File Reference using current client (@{bot_client_name})...")
+    # --- 3. METADATA FETCHING (ONLY SIZE/TITLE) ---
+    logging.info(f"Fetching File Size/Title using @{bot_client_name}...")
     
     try:
-        # BOT client se fresh reference aur metadata le rahe hain
-        message = await download_client.get_messages(resolved_entity, ids=file_id_int) 
+        # BOT client से सिर्फ साइज़/टाइटल निकालने के लिए
+        resolved_entity = await fetch_client.get_entity(TEST_CHANNEL_ENTITY_USERNAME)
+        message = await fetch_client.get_messages(resolved_entity, ids=file_id_int) 
         
         media_entity = None
         if message and message.media:
-            if hasattr(message.media, 'document') and message.media.document:
-                media_entity = message.media.document
-            elif hasattr(message.media, 'video') and message.media.video:
-                # Agar video entity hai, to hum usko hi use kar sakte hain
-                media_entity = message.media.video
-            
-            # Agar sirf Photo (thumbnail) hai toh woh streamable nahi hota, but hum fir bhi document/video hi dekhenge
-            if not media_entity and hasattr(message.media, 'document'):
-                 media_entity = message.media.document
-            
+            media_entity = message.media.document or message.media.video
         
-        if media_entity:
-            # Agar cache miss/expired tha, toh fresh size aur title update karo
-            if file_size == 0 and hasattr(media_entity, 'size'):
-                file_size = media_entity.size
-                
-                # File title Document/Video attributes se nikalna
-                if hasattr(media_entity, 'attributes'):
-                    for attr in media_entity.attributes:
-                        if hasattr(attr, 'file_name'):
-                            file_title = attr.file_name
-                            break
-            
-            # CRITICAL: File Reference current client ke liye fresh hona anivarya hai
-            if not hasattr(media_entity, 'file_reference') or not media_entity.file_reference:
-                 logging.error(f"Metadata FAILED: File reference missing for message {file_id_int}. Bot cannot download.")
-                 raise HTTPException(status_code=500, detail="Internal error: File reference missing.")
-            
-            # Current client ke liye fresh entity set karo
-            file_entity_for_download = media_entity
-            
-            # Cache ko sirf size/title/timestamp ke liye update karo
-            FILE_METADATA_CACHE[file_id_int] = {
-                'size': file_size,
-                'title': file_title,
-                'timestamp': current_time
-            }
-            logging.info(f"Fresh File Reference fetched by @{bot_client_name}. Size: {file_size}")
+        if media_entity and hasattr(media_entity, 'size'):
+            file_size = media_entity.size
+            if hasattr(media_entity, 'attributes'):
+                for attr in media_entity.attributes:
+                    if hasattr(attr, 'file_name'):
+                        file_title = attr.file_name
+                        break
+            logging.info(f"Size/Title fetched successfully. Size: {file_size}")
         else:
             logging.error(f"Metadata FAILED: Message {file_id_int} not found or no suitable media.")
-            raise HTTPException(status_code=404, detail="File not found in the specified channel or is not a streamable media type.")
+            raise HTTPException(status_code=404, detail="File not found in the specified channel.")
 
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"METADATA RESOLUTION ERROR (@{bot_client_name}): {type(e).__name__}: {e}.")
-        FILE_METADATA_CACHE.pop(file_id_int, None) 
-        raise HTTPException(status_code=500, detail="Internal error resolving Telegram file metadata.")
-          # 6. Range Handling aur Headers (Remaining logic same rahega)
+        raise HTTPException(status_code=500, detail="Internal error resolving Telegram file size/title.")
+        
+    
+    # --- 4. Range Handling aur Headers ---
     range_header = request.headers.get("range")
     
     content_type = "video/mp4" 
     if file_title.lower().endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.lower().endswith(".mp4"): content_type = "video/mp4"
-    elif file_title.lower().endswith(".webm"): content_type = "video/webm"
-    elif file_title.lower().endswith(".avi"): content_type = "video/x-msvideo"
-    elif file_title.lower().endswith((".jpg", ".jpeg")): content_type = "image/jpeg"
-    elif file_title.lower().endswith(".png"): content_type = "image/png"
+    # ... other content types ...
 
 
-    # StreamingResponse (Ab file_entity_for_download mein hamesha current bot ka valid reference hai)
+    # StreamingResponse
     if range_header:
         # Partial Content (206) response
         try:
@@ -476,9 +451,6 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             start_range = 0
             
         content_length = file_size - start_range
-        
-         # Ab hum 'file_size - 1' tak hi jayenge, na ki file_size tak.
-        # HTTP range 0-based indexing use karta hai (e.g., 0-999 for 1000 bytes).
         end_range_for_header = file_size - 1 
         
         headers = { 
@@ -490,7 +462,8 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             "Connection": "keep-alive"
         }
         return StreamingResponse(
-            file_iterator(download_client, file_entity_for_download, file_id_int, file_size, range_header, request), 
+            # Producer को अब सिर्फ ID और Channel Name पास किया गया है
+            file_iterator(fetch_client, file_id_int, file_size, range_header, request), 
             status_code=status.HTTP_206_PARTIAL_CONTENT,
             headers=headers
         )
@@ -505,6 +478,23 @@ async def stream_file_by_message_id(message_id: str, request: Request):
         }
         
         return StreamingResponse(
-            file_iterator(download_client, file_entity_for_download, file_id_int, file_size, None, request),
+             # Producer को अब सिर्फ ID और Channel Name पास किया गया है
+            file_iterator(fetch_client, file_id_int, file_size, range_header, request), 
+            status_code=status.HTTP_206_PARTIAL_CONTENT,
+            headers=headers
+        )
+    else:
+        # Full content request (200) response
+        headers = { 
+            "Content-Type": content_type,
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f"inline; filename=\"{file_title}\"",
+            "Connection": "keep-alive"
+        }
+        
+        return StreamingResponse(
+            # Producer को अब सिर्फ ID और Channel Name पास किया गया है
+            file_iterator(fetch_client, file_id_int, file_size, None, request),
             headers=headers
         )
