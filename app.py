@@ -1,4 +1,4 @@
-# --- TELEGRAM STREAMING SERVER (CLOUD READY - ASYNC BUFFERING & LAZY CACHING) ---
+# --- TELEGRAM STREAMING SERVER (CLOUD READY - MTPROTO HACK) ---
 
 # Import necessary libraries
 from telethon.sessions import StringSession 
@@ -6,7 +6,8 @@ import asyncio
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from telethon import TelegramClient
-# BotMethodInvalidError ko bhi handle karna hoga agar Bot private channel mein get_messages call karta hai
+# MTProto Hack ke liye naya import
+from telethon.tl.functions.upload import GetFileRequest
 from telethon.errors import RPCError, FileReferenceExpiredError, AuthKeyError, FloodWaitError, BotMethodInvalidError
 import logging
 import time
@@ -67,7 +68,7 @@ def get_next_bot_client() -> Optional[TelegramClient]:
 
 # --- CONFIGURATION (LOW RAM & CACHING OPTIMIZATION) ---
 TEST_CHANNEL_ENTITY_USERNAME = 'https://t.me/hPquYFblYHkxYzg1' 
-OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size
+OPTIMAL_CHUNK_SIZE = 1024 * 1024 * 2 # 2 MB chunk size (MTProto ke liye max 1MB se thoda zyada)
 BUFFER_CHUNK_COUNT = 4 
 
 # ** PINGER CONFIGURATION **
@@ -201,7 +202,7 @@ async def root():
     return PlainTextResponse(f"Streaming Proxy Status: {status_msg}")
 
 
-# 🚨 Download Producer (Purane Single-Bot Style mein: NO Refresh Logic) 🚨
+# 🚨 UPDATED DOWNLOAD PRODUCER (MTProto HACK - Raw GetFileRequest) 🚨
 async def download_producer(
     client_instance: TelegramClient, # Initial client (Bot)
     file_entity, 
@@ -213,7 +214,7 @@ async def download_producer(
 ):
     """
     Background mein Telegram se data download karke queue mein daalta hai (Producer)।
-    Yeh function ab hamesha current client ke fresh reference ke saath chalta hai.
+    Yeh direct MTProto `upload.GetFileRequest` call karta hai sirf maangi hui bytes ke liye।
     """
     offset = start_offset
     
@@ -222,33 +223,45 @@ async def download_producer(
     except:
         client_name = 'bot_worker'
         
+    logging.info(f"PRODUCER START (@{client_name}): Streaming range {start_offset} - {end_offset} for file {file_id_int}.")
     
-    # Hum seedhe download loop chalaenge
     try:
+        # File entity se MTProto location object nikalna
+        location = client_instance.get_file_location_location(file_entity)
+        
         while offset <= end_offset:
             
+            # Kitne bytes maangne hain (end_offset tak ya OPTIMAL_CHUNK_SIZE)
             limit = min(chunk_size, end_offset - offset + 1)
             
-            # --- Download Attempt ---
-            async for chunk in client_instance.iter_download( 
-                file_entity, 
-                offset=offset,
-                limit=limit,
-                chunk_size=chunk_size
-            ):
-                await queue.put(chunk)
-                offset += len(chunk)
-
-            if offset <= end_offset:
-                 logging.error(f"PRODUCER BREAK ({client_name}): Download loop finished before offset reached {end_offset}. Stopping.")
-                 break 
+            # --- MTProto Hack: Raw upload.GetFileRequest Call ---
+            result = await client_instance(
+                GetFileRequest(
+                    location=location, 
+                    offset=offset, 
+                    limit=limit
+                )
+            )
+            
+            # Telegram se bytes (.bytes) extract karna
+            chunk = result.bytes 
+            
+            if not chunk:
+                # Agar Telegram ne empty response di aur hum end_offset tak nahi pahuche, toh error.
+                logging.error(f"PRODUCER BREAK ({client_name}): Empty chunk received at offset {offset}. Stopping stream.")
+                break 
+            
+            await queue.put(chunk)
+            offset += len(chunk)
         
-    # 💥 FileReferenceExpiredError/RPCError aane par, stream band kar denge.
+        logging.info(f"PRODUCER END ({client_name}): Successfully reached end_offset {end_offset}.")
+        
+    # 💥 FileReferenceExpiredError aane par, stream band kar denge.
     except (FileReferenceExpiredError, RPCError, TimeoutError, AuthKeyError) as e:
-        logging.error(f"PRODUCER CRITICAL ERROR ({client_name}): {type(e).__name__} during download. Stopping stream (Reference expired, no self-refresh).")
+        logging.error(f"PRODUCER CRITICAL ERROR (@{client_name}): {type(e).__name__} during MTProto download. Stopping stream.")
         
     except Exception as e:
-        logging.error(f"PRODUCER UNHANDLED EXCEPTION ({client_name}): {e}")
+        logging.error(f"PRODUCER UNHANDLED EXCEPTION (@{client_name}): {type(e).__name__}: {e}")
     
     # FINAL: Queue ko hamesha band karo
     await queue.put(None)
@@ -304,7 +317,7 @@ async def file_iterator(client_instance_for_download, file_entity_for_download, 
 
 
 # ----------------------------------------------------------------------
-# 🔥 FIX APPLIED HERE: stream_file_by_message_id (Forced Fresh Entity Fetch)
+# 🔥 stream_file_by_message_id (Metadata Fetching)
 # ----------------------------------------------------------------------
 @app.get("/api/stream/movie/{message_id}")
 async def stream_file_by_message_id(message_id: str, request: Request):
@@ -424,6 +437,11 @@ async def stream_file_by_message_id(message_id: str, request: Request):
     content_type = "video/mp4" 
     if file_title.lower().endswith(".mkv"): content_type = "video/x-matroska"
     elif file_title.lower().endswith(".mp4"): content_type = "video/mp4"
+    elif file_title.lower().endswith(".webm"): content_type = "video/webm"
+    elif file_title.lower().endswith(".avi"): content_type = "video/x-msvideo"
+    elif file_title.lower().endswith((".jpg", ".jpeg")): content_type = "image/jpeg"
+    elif file_title.lower().endswith(".png"): content_type = "image/png"
+
 
     # StreamingResponse (Ab file_entity_for_download mein hamesha current bot ka valid reference hai)
     if range_header:
@@ -436,11 +454,15 @@ async def stream_file_by_message_id(message_id: str, request: Request):
             
         content_length = file_size - start_range
         
+           # Ab hum 'file_size - 1' tak hi jayenge, na ki file_size tak.
+        # HTTP range 0-based indexing use karta hai (e.g., 0-999 for 1000 bytes).
+        end_range_for_header = file_size - 1 
+        
         headers = { 
             "Content-Type": content_type,
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
-            "Content-Range": f"bytes {start_range}-{file_size - 1}/{file_size}",
+            "Content-Range": f"bytes {start_range}-{end_range_for_header}/{file_size}",
             "Content-Disposition": f"inline; filename=\"{file_title}\"",
             "Connection": "keep-alive"
         }
