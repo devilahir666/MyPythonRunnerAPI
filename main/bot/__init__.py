@@ -6,14 +6,14 @@ from pyrogram import Client
 from os import getcwd
 
 StreamBot = Client(
-    session_name="main",
+   # session_name="main",#
     api_id=Var.API_ID,
     api_hash=Var.API_HASH,
     workdir="main",
     plugins={"root": "main/bot/plugins"},
     bot_token=Var.BOT_TOKEN,
     sleep_threshold=Var.SLEEP_THRESHOLD,
-    workers=Var.WORKERS,
+  #  workers=Var.WORKERS,#
 )
 
 multi_clients = {}
