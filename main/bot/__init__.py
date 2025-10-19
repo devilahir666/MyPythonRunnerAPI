@@ -9,7 +9,10 @@ StreamBot = Client(
     session_name="main",
     api_id=Var.API_ID,
     api_hash=Var.API_HASH,
-    workdir="main",
+    # **Yahan Badlav Kiya Gaya Hai:**
+    # workdir="main" ki jagah workdir="./" use kiya gaya hai
+    # taaki Pyrogram time sync files ko sahi jagah par save kar sake.
+    workdir="./", 
     plugins={"root": "main/bot/plugins"},
     bot_token=Var.BOT_TOKEN,
     sleep_threshold=Var.SLEEP_THRESHOLD,
