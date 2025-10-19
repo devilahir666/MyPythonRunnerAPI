@@ -6,14 +6,17 @@ from pyrogram import Client
 from os import getcwd
 
 StreamBot = Client(
-   # session_name="main",#
+    # Pyrogram v2.0 के लिए पहला आर्गुमेंट (नाम) ज़रूरी है।
+    "main",  
     api_id=Var.API_ID,
     api_hash=Var.API_HASH,
-    workdir="main",
+    # v2.0 में 'workdir' की जगह 'storage_directory' का उपयोग होता है
+    storage_directory="main", 
     plugins={"root": "main/bot/plugins"},
     bot_token=Var.BOT_TOKEN,
     sleep_threshold=Var.SLEEP_THRESHOLD,
-  #  workers=Var.WORKERS,#
+    # 'workers' अब Client.__init__ में नहीं, बल्कि .run() या .start() में होता है।
+    # इसलिए इसे कमेंट रहने दें।
 )
 
 multi_clients = {}
