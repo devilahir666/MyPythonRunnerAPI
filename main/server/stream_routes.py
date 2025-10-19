@@ -35,6 +35,13 @@ async def root_route_handler(_):
         }
     )
 
+# ****** FIX YAHAN ADD KIYA GAYA HAI ******
+# Yeh Webhook se aane wali POST requests ko turant 200 OK response bhejta hai.
+@routes.post("/", allow_head=True)
+async def webhook_ack_handler(_):
+    return web.Response(text="OK")
+# ****************************************
+
 @routes.get(r"/watch/{path:\S+}", allow_head=True)
 async def stream_handler(request: web.Request):
     try:
@@ -158,3 +165,4 @@ async def media_streamer(request: web.Request, message_id: int, secure_hash: str
         return_resp.headers.add("Content-Length", str(file_size))
 
     return return_resp
+    
