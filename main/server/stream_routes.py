@@ -17,32 +17,14 @@ from main.utils.render_template import render_page
 
 routes = web.RouteTableDef()
 
-# Badlav 1: allow_head=True hataya
-@routes.get("/") 
-async def root_route_handler(_):
-    return web.json_response(
-        {
-            "server_status": "running",
-            "uptime": utils.get_readable_time(time.time() - StartTime),
-            "telegram_bot": "@" + StreamBot.username,
-            "connected_bots": len(multi_clients),
-            "loads": dict(
-                ("bot" + str(c + 1), l)
-                for c, (_, l) in enumerate(
-                    sorted(work_loads.items(), key=lambda x: x[1], reverse=True)
-                )
-            ),
-            "version": __version__,
-        }
-    )
+# @routes.get("/") ROOT_ROUTE_HANDLER KO HATA DIYA GAYA HAI
+# Upar se jo code aapne diya tha, usmein Line 18 se 31 tak ka code delete kar diya gaya hai.
 
-# Badlav 2: allow_head=True hataya
-@routes.post("/")
+@routes.post("/", allow_head=True)
 async def webhook_ack_handler(_):
     return web.Response(text="OK")
 
-# Badlav 3: allow_head=True hataya
-@routes.get(r"/watch/{path:\S+}")
+@routes.get(r"/watch/{path:\S+}", allow_head=True)
 async def stream_handler(request: web.Request):
     try:
         path = request.match_info["path"]
@@ -64,8 +46,7 @@ async def stream_handler(request: web.Request):
         logging.critical(e.with_traceback(None))
         raise web.HTTPInternalServerError(text=str(e))
 
-# Akhri route jismein allow_head tha, usko bhi theek kar dete hain (Line 90)
-@routes.get(r"/{path:\S+}") # Badlav 4: allow_head=True hataya
+@routes.get(r"/{path:\S+}", allow_head=True)
 async def stream_handler(request: web.Request):
     try:
         path = request.match_info["path"]
@@ -90,6 +71,11 @@ async def stream_handler(request: web.Request):
 class_cache = {}
 
 async def media_streamer(request: web.Request, message_id: int, secure_hash: str):
+    # ... (Baki code same hai) ...
+    # Yahan maine sirf upar wale 3 routes mein badlav kiya hai (allow_head=True hataya gaya tha)
+    # Taki aiohttp ka naya version is code ke saath chal sake.
+
+    #... (Baki media_streamer function ka code same rahega)
     range_header = request.headers.get("Range", 0)
     
     index = min(work_loads, key=work_loads.get)
