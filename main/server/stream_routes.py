@@ -17,14 +17,15 @@ from main.utils.render_template import render_page
 
 routes = web.RouteTableDef()
 
-# @routes.get("/") ROOT_ROUTE_HANDLER KO HATA DIYA GAYA HAI
-# Upar se jo code aapne diya tha, usmein Line 18 se 31 tak ka code delete kar diya gaya hai.
+# @routes.get("/") root_route_handler hata diya gaya hai.
 
-@routes.post("/", allow_head=True)
+# FIX: allow_head hata diya gaya
+@routes.post("/") 
 async def webhook_ack_handler(_):
     return web.Response(text="OK")
 
-@routes.get(r"/watch/{path:\S+}", allow_head=True)
+# FIX: allow_head hata diya gaya
+@routes.get(r"/watch/{path:\S+}")
 async def stream_handler(request: web.Request):
     try:
         path = request.match_info["path"]
@@ -46,7 +47,8 @@ async def stream_handler(request: web.Request):
         logging.critical(e.with_traceback(None))
         raise web.HTTPInternalServerError(text=str(e))
 
-@routes.get(r"/{path:\S+}", allow_head=True)
+# FIX: allow_head hata diya gaya
+@routes.get(r"/{path:\S+}")
 async def stream_handler(request: web.Request):
     try:
         path = request.match_info["path"]
@@ -71,11 +73,7 @@ async def stream_handler(request: web.Request):
 class_cache = {}
 
 async def media_streamer(request: web.Request, message_id: int, secure_hash: str):
-    # ... (Baki code same hai) ...
-    # Yahan maine sirf upar wale 3 routes mein badlav kiya hai (allow_head=True hataya gaya tha)
-    # Taki aiohttp ka naya version is code ke saath chal sake.
-
-    #... (Baki media_streamer function ka code same rahega)
+    # ... (Baaki code same rahega) ...
     range_header = request.headers.get("Range", 0)
     
     index = min(work_loads, key=work_loads.get)
