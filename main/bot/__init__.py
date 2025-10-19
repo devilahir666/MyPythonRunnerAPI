@@ -6,12 +6,11 @@ from pyrogram import Client
 from os import getcwd
 
 StreamBot = Client(
-    session_name="main",
+    # ****** Yahan session_name ko name se badla gaya hai ******
+    name="main",
     api_id=Var.API_ID,
     api_hash=Var.API_HASH,
-    # **Yahan Badlav Kiya Gaya Hai:**
-    # workdir="main" ki jagah workdir="./" use kiya gaya hai
-    # taaki Pyrogram time sync files ko sahi jagah par save kar sake.
+    # workdir="./" fix barkaraar hai
     workdir="./", 
     plugins={"root": "main/bot/plugins"},
     bot_token=Var.BOT_TOKEN,
