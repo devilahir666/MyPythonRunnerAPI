@@ -1,5 +1,4 @@
-aiohttp
 pyrogram
+uvicorn
+fastapi
 python-dotenv
-tgcrypto
-aiofiles
