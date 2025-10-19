@@ -1,0 +1,5 @@
+aiohttp
+pyrogram==1.4.12
+python-dotenv
+tgcrypto
+aiofiles
