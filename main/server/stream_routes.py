@@ -17,7 +17,8 @@ from main.utils.render_template import render_page
 
 routes = web.RouteTableDef()
 
-@routes.get("/", allow_head=True)
+# Badlav 1: allow_head=True hataya
+@routes.get("/") 
 async def root_route_handler(_):
     return web.json_response(
         {
@@ -35,14 +36,13 @@ async def root_route_handler(_):
         }
     )
 
-# ****** FIX YAHAN ADD KIYA GAYA HAI ******
-# Yeh Webhook se aane wali POST requests ko turant 200 OK response bhejta hai.
-@routes.post("/", allow_head=True)
+# Badlav 2: allow_head=True hataya
+@routes.post("/")
 async def webhook_ack_handler(_):
     return web.Response(text="OK")
-# ****************************************
 
-@routes.get(r"/watch/{path:\S+}", allow_head=True)
+# Badlav 3: allow_head=True hataya
+@routes.get(r"/watch/{path:\S+}")
 async def stream_handler(request: web.Request):
     try:
         path = request.match_info["path"]
@@ -64,7 +64,8 @@ async def stream_handler(request: web.Request):
         logging.critical(e.with_traceback(None))
         raise web.HTTPInternalServerError(text=str(e))
 
-@routes.get(r"/{path:\S+}", allow_head=True)
+# Akhri route jismein allow_head tha, usko bhi theek kar dete hain (Line 90)
+@routes.get(r"/{path:\S+}") # Badlav 4: allow_head=True hataya
 async def stream_handler(request: web.Request):
     try:
         path = request.match_info["path"]
