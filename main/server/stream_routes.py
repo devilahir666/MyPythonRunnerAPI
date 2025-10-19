@@ -17,14 +17,8 @@ from main.utils.render_template import render_page
 
 routes = web.RouteTableDef()
 
-# @routes.get("/") root_route_handler hata diya gaya hai.
+# @routes.post("/") function yahan se hata diya gaya hai.
 
-# FIX: allow_head hata diya gaya
-@routes.post("/") 
-async def webhook_ack_handler(_):
-    return web.Response(text="OK")
-
-# FIX: allow_head hata diya gaya
 @routes.get(r"/watch/{path:\S+}")
 async def stream_handler(request: web.Request):
     try:
@@ -47,7 +41,6 @@ async def stream_handler(request: web.Request):
         logging.critical(e.with_traceback(None))
         raise web.HTTPInternalServerError(text=str(e))
 
-# FIX: allow_head hata diya gaya
 @routes.get(r"/{path:\S+}")
 async def stream_handler(request: web.Request):
     try:
