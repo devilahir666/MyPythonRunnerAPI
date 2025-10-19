@@ -14,11 +14,11 @@ async def ping_handler(request):
 def web_server():
     web_app = web.Application(client_max_size=30000000)
     
-    # ****** FIX: Yahan naya handler add kiya gaya hai ******
+    # FIX: Yahan naya handler add kiya gaya hai
     # Yeh Webhook aur Render health check ko turant 200 OK dega.
+    # Note: add_get/add_post se HEAD conflict ho raha tha, isliye isko rakhna zaroori hai.
     web_app.router.add_get('/', ping_handler)
     web_app.router.add_post('/', ping_handler)
-    # ******************************************************
     
     web_app.add_routes(routes)
     return web_app
