@@ -30,6 +30,8 @@ async def initialize_clients():
             if client_id == len(all_tokens):
                 await asyncio.sleep(2)
                 print("This will take some time, please wait...")
+            
+            # ****** Yahan Badlav Kiya Gaya Hai ******
             client = await Client(
                 session_name=session_name,
                 api_id=Var.API_ID,
@@ -37,7 +39,11 @@ async def initialize_clients():
                 bot_token=bot_token,
                 sleep_threshold=Var.SLEEP_THRESHOLD,
                 no_updates=True,
+                # Nayi line: workdir add kiya gaya hai
+                workdir="./", 
             ).start()
+            # ****************************************
+            
             work_loads[client_id] = 0
             return client_id, client
         except Exception:
@@ -50,3 +56,4 @@ async def initialize_clients():
         print("Multi-Client Mode Enabled")
     else:
         print("No additional clients were initialized, using default client")
+        
