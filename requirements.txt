@@ -2,3 +2,4 @@ pyrogram
 uvicorn
 fastapi
 python-dotenv
+gunicorn
