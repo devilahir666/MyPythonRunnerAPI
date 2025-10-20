@@ -3,6 +3,7 @@
 import sys
 import asyncio
 import logging
+import signal
 from aiohttp import web
 from pyrogram import idle
 
@@ -27,13 +28,12 @@ logging.getLogger("aiohttp.web").setLevel(logging.ERROR)
 # Web server
 server = web.AppRunner(web_server())
 
-# Asyncio event loop
-if sys.version_info[1] > 9:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-else:
-    loop = asyncio.get_event_loop()
+# Graceful shutdown on SIGTERM (Render)
+def sigterm_handler():
+    print("SIGTERM received. Shutting down bot and server...")
+    asyncio.create_task(cleanup())
 
+signal.signal(signal.SIGTERM, lambda s,f: sigterm_handler())
 
 async def start_services():
     print("\n-------------------- Initializing Telegram Bot --------------------")
@@ -77,18 +77,23 @@ async def start_services():
 
 
 async def cleanup():
-    await StreamBot.stop()
-    await server.cleanup()
+    print("-------------------- Cleaning up --------------------")
+    try:
+        await StreamBot.stop()
+    except Exception as e:
+        logging.error(f"Error stopping bot: {e}")
+    try:
+        await server.cleanup()
+    except Exception as e:
+        logging.error(f"Error stopping server: {e}")
 
 
 if __name__ == "__main__":
     try:
-        loop.run_until_complete(start_services())
+        asyncio.run(start_services())  # <- updated
     except KeyboardInterrupt:
         pass
     except Exception as err:
-        logging.error(err.with_traceback(None))
+        logging.error(err)
     finally:
-        loop.run_until_complete(cleanup())
-        loop.stop()
         print("------------------------ Stopped Services ------------------------")
