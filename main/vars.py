@@ -15,7 +15,7 @@ class Var(object):
     SLEEP_THRESHOLD = int(environ.get("SLEEP_THRESHOLD", "60"))
     WORKERS = int(environ.get("WORKERS", "6"))
     BIN_CHANNEL = int(environ.get("BIN_CHANNEL", None))
-    PORT = int(environ.get("PORT", 8080))
+    PORT = int(environ.get("PORT", 10000))
     BIND_ADDRESS = str(environ.get("WEB_SERVER_BIND_ADDRESS", "0.0.0.0"))
     PING_INTERVAL = int(environ.get("PING_INTERVAL", "1200"))
     HAS_SSL = str(environ.get("HAS_SSL", "False")).lower() == "true"
