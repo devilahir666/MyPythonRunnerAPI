@@ -1,5 +1,5 @@
-pyrogram
-uvicorn
-fastapi
-python-dotenv
-gunicorn
+aiohttp>=3.8.5
+pyrogram>=2.0.48
+python-dotenv>=1.0.0
+tgcrypto>=1.2.2
+aiofiles>=23.2.1
